@@ -270,3 +270,115 @@ def test_measured_bytes_are_exact_and_tokens_remain_estimates(monkeypatch):
     # Byte size is exact and reproducible; token size is explicitly an estimate.
     assert measured >= 252_840 + len(REQUEST_MARKER.encode())
     assert 80_000 < estimated_tokens < 95_000  # ~84K scale class, estimate band
+
+
+def test_local_tool_call_batch_expansion_matches_hermes_and_keeps_delta(monkeypatch):
+    """Multi-entry local tool_call batches must expand deterministically before
+    response_fingerprint so Hermes' expand_local_tool_batches does not cause frontier_mismatch."""
+    import hashlib
+    import json
+    from types import SimpleNamespace
+
+    client = _load_client(monkeypatch)
+    history = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "find notes"},
+    ]
+    batch_entries = [
+        {"name": "search_notes", "arguments": {"limit": 5}},
+        {"name": "search_notes", "arguments": {"query": "筆記"}},
+    ]
+    emitted = [
+        SimpleNamespace(
+            id="call_batch_1",
+            type="function",
+            function=SimpleNamespace(
+                name="tool_call",
+                arguments=json.dumps({"calls": batch_entries}, ensure_ascii=False),
+            ),
+        )
+    ]
+
+    expanded = client._expand_local_tool_call_batches(emitted)
+    assert len(expanded) == 2
+    args0 = json.dumps({"calls": [batch_entries[0]]}, ensure_ascii=False)
+    args1 = json.dumps({"calls": [batch_entries[1]]}, ensure_ascii=False)
+    expected_id1 = "call_" + hashlib.sha256(
+        f"tool_call:call_batch_1{args1}:1".encode("utf-8")
+    ).hexdigest()[:12]
+    assert expanded[0].id == "call_batch_1"
+    assert expanded[0].function.arguments == args0
+    assert expanded[1].id == expected_id1
+    assert expanded[1].function.arguments == args1
+
+    fingerprint = client._context_fingerprint("fake-model-a", None, None)
+    state = client.ACPConversationState(
+        session_id="s-batch-test",
+        context_fingerprint=fingerprint,
+        request_fingerprints=tuple(client._message_fingerprint(m) for m in history),
+        response_fingerprint=client._response_fingerprint("", expanded),
+        updated_at=0.0,
+        native_tokens=100,
+    )
+    assistant_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": c.id,
+                "type": c.type,
+                "function": {"name": c.function.name, "arguments": c.function.arguments},
+            }
+            for c in expanded
+        ],
+    }
+    tool_results = [
+        {"role": "tool", "tool_call_id": c.id, "content": f"ok-{idx}"}
+        for idx, c in enumerate(expanded)
+    ]
+    delta = client._continuation_delta(history + [assistant_msg, *tool_results], state, fingerprint)
+    assert delta == tool_results
+
+    # Connector-only batches, singletons, and >10 oversized batches stay untouched.
+    connector_only = [
+        SimpleNamespace(
+            id="call_conn",
+            type="function",
+            function=SimpleNamespace(
+                name="tool_call",
+                arguments=json.dumps({
+                    "calls": [
+                        {"name": "connectors__alpha__one", "arguments": {}},
+                        {"name": "connectors__alpha__two", "arguments": {}},
+                    ]
+                }),
+            ),
+        )
+    ]
+    assert client._expand_local_tool_call_batches(connector_only) == connector_only
+
+    singleton = [
+        SimpleNamespace(
+            id="call_single",
+            type="function",
+            function=SimpleNamespace(
+                name="tool_call",
+                arguments=json.dumps({"calls": [batch_entries[0]]}),
+            ),
+        )
+    ]
+    assert client._expand_local_tool_call_batches(singleton) == singleton
+
+    oversized = [
+        SimpleNamespace(
+            id="call_over",
+            type="function",
+            function=SimpleNamespace(
+                name="tool_call",
+                arguments=json.dumps({
+                    "calls": [{"name": "search_notes", "arguments": {"i": i}} for i in range(11)]
+                }),
+            ),
+        )
+    ]
+    assert client._expand_local_tool_call_batches(oversized) == oversized

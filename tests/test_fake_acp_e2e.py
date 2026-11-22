@@ -298,8 +298,12 @@ for line in sys.stdin:
                     f"{status}: the current-source research objective remains unresolved; "
                     "no current sources were verified."
                 )
+            elif "local-tool-batch-step-2" in text:
+                response = "done after expanded batch"
             else:
                 response = "done after tool result"
+        elif "local-tool-batch-step-1" in text:
+            response = "<tool_call>" + json.dumps({"id": "call_batch_1", "type": "function", "function": {"name": "tool_call", "arguments": json.dumps({"calls": [{"name": "read_state", "arguments": {"path": "a"}}, {"name": "read_state", "arguments": {"path": "b"}}]})}}) + "</tool_call>"
         elif "inspect" in text:
             response = '<tool_call>{"id":"call-1","type":"function","function":{"name":"read_state","arguments":"{\\"path\\":\\"x\\"}"}}</tool_call>'
         else:
@@ -2136,3 +2140,101 @@ def test_provider_through_mux_to_fake_server_owner_routing(monkeypatch, tmp_path
     assert "native session GC disabled" in selection
     assert "session-gc expired" not in selection
     assert "owner-records" in selection
+
+
+def test_local_tool_call_batch_expansion_keeps_native_continuation_delta(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Multi-entry local tool_call batches expand deterministically before
+    response_fingerprint so the next turn stays on continuation_delta."""
+    import hashlib
+
+    script, log_path = _write_fake_server(tmp_path)
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(script), str(log_path)],
+        cwd=str(tmp_path),
+    )
+    caplog.set_level(logging.INFO)
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "tool_call",
+            "description": "Invoke deferred tools",
+            "parameters": {"type": "object", "properties": {"calls": {"type": "array"}}},
+        },
+    }]
+
+    turn1_messages = [{"role": "user", "content": "local-tool-batch-step-1"}]
+    first = client.chat.completions.create(
+        model="fake-model-a",
+        messages=turn1_messages,
+        tools=tools,
+    )
+    expanded_calls = first.choices[0].message.tool_calls
+    assert len(expanded_calls) == 2
+    args0 = json.dumps({"calls": [{"name": "read_state", "arguments": {"path": "a"}}]}, ensure_ascii=False)
+    args1 = json.dumps({"calls": [{"name": "read_state", "arguments": {"path": "b"}}]}, ensure_ascii=False)
+    expected_id1 = "call_" + hashlib.sha256(
+        f"tool_call:call_batch_1{args1}:1".encode("utf-8")
+    ).hexdigest()[:12]
+    assert expanded_calls[0].id == "call_batch_1"
+    assert expanded_calls[0].function.arguments == args0
+    assert expanded_calls[1].id == expected_id1
+    assert expanded_calls[1].function.arguments == args1
+
+    turn2_messages = [
+        *turn1_messages,
+        {
+            "role": "assistant",
+            "content": first.choices[0].message.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in expanded_calls
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": expanded_calls[0].id,
+            "name": expanded_calls[0].function.name,
+            "content": "result-a",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": expanded_calls[1].id,
+            "name": expanded_calls[1].function.name,
+            "content": "local-tool-batch-step-2",
+        },
+    ]
+    second = client.chat.completions.create(
+        model="fake-model-a",
+        messages=turn2_messages,
+        tools=tools,
+    )
+    assert second.choices[0].message.content == "done after expanded batch"
+
+    continuation_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "ACP continuation: reason=continuation_delta" in record.getMessage()
+    ]
+    assert len(continuation_lines) == 1
+    assert "frontier changed" not in caplog.text
+    assert "frontier_mismatch" not in caplog.text
+
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    prompts = [row for row in rows if row.get("method") == "session/prompt"]
+    assert len(prompts) == 2
+    assert len([row for row in rows if row.get("method") == "session/new"]) == 1
+    assert len([row for row in rows if row.get("method") == "session/resume"]) == 1
+    prompt2_text = "".join(
+        block.get("text", "")
+        for block in prompts[1]["params"].get("prompt", [])
+        if block.get("type") == "text"
+    )
+    assert "<HISTORICAL_CONTEXT>" not in prompt2_text

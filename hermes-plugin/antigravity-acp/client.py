@@ -20,6 +20,7 @@ import atexit
 import base64
 import contextlib
 import contextvars
+import copy
 import hashlib
 import itertools
 from importlib import import_module
@@ -3022,6 +3023,127 @@ def _context_fingerprint(
     return _sha256_text(payload)
 
 
+_MAX_LOCAL_TOOL_BATCH_CALLS = 10
+_TOOL_CALL_BRIDGE_NAME = "tool_call"
+_BRIDGE_TOOL_NAMES = frozenset({"tool_search", "tool_describe", _TOOL_CALL_BRIDGE_NAME})
+_CONNECTOR_NAME_PREFIX = "connectors__"
+
+
+def _coalesce_tool_call_id(call: Any) -> str:
+    for key in ("call_id", "id"):
+        raw = call.get(key) if isinstance(call, dict) else getattr(call, key, None)
+        value = raw.strip() if isinstance(raw, str) else ""
+        if value:
+            return value.split("|", 1)[0].strip() or value
+    return ""
+
+
+def _deterministic_tool_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
+    seed = f"{fn_name}:{arguments}:{index}"
+    return f"call_{hashlib.sha256(seed.encode('utf-8', errors='replace')).hexdigest()[:12]}"
+
+
+def _normalize_local_tool_batch_entries(args: Any) -> tuple[list[dict[str, Any]], bool]:
+    if not isinstance(args, dict):
+        return [], True
+    raw_calls = args.get("calls")
+    if raw_calls is None:
+        if not str(args.get("name") or "").strip():
+            return [], True
+        raw_calls = [{"name": args.get("name"), "arguments": args.get("arguments")}]
+    if isinstance(raw_calls, str):
+        try:
+            raw_calls = json.loads(raw_calls)
+        except json.JSONDecodeError:
+            return [], True
+    if isinstance(raw_calls, dict):
+        raw_calls = [raw_calls]
+    if not isinstance(raw_calls, list) or not raw_calls:
+        return [], True
+
+    entries: list[dict[str, Any]] = []
+    for raw in raw_calls:
+        if not isinstance(raw, dict):
+            return [], True
+        name = str(raw.get("name") or "").strip()
+        if not name or name in _BRIDGE_TOOL_NAMES:
+            return [], True
+        raw_args = raw.get("arguments")
+        if raw_args is None or (isinstance(raw_args, str) and not raw_args.strip()):
+            raw_args = {}
+        if isinstance(raw_args, str):
+            try:
+                raw_args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                return [], True
+        if not isinstance(raw_args, dict):
+            return [], True
+        entries.append({"name": name, "arguments": raw_args})
+    return entries, False
+
+
+def _expand_local_tool_call_batches(tool_calls: list[Any]) -> list[Any]:
+    """Pre-empt Hermes expand_local_tool_batches so response_fingerprint stays aligned.
+
+    Hermes splits multi-entry local ``tool_call`` batches (``{"calls": [...]}``)
+    after the client returns, assigning ``deterministic_call_id`` to entries 1..N-1.
+    Without matching that expansion before computing ``response_fingerprint``, the
+    very next turn hits ``frontier_mismatch`` and falls back to full replay.
+    """
+    if not tool_calls:
+        return tool_calls
+    expanded: list[Any] = []
+    for call in tool_calls:
+        fn = getattr(call, "function", None)
+        if getattr(fn, "name", None) != _TOOL_CALL_BRIDGE_NAME:
+            expanded.append(call)
+            continue
+        try:
+            args = getattr(fn, "arguments", None)
+            parsed = json.loads(args) if isinstance(args, str) else args
+            entries, error = _normalize_local_tool_batch_entries(parsed)
+        except (TypeError, ValueError, AttributeError):
+            entries, error = [], True
+        if (
+            error
+            or not 1 < len(entries) <= _MAX_LOCAL_TOOL_BATCH_CALLS
+            or all(entry["name"].startswith(_CONNECTOR_NAME_PREFIX) for entry in entries)
+        ):
+            expanded.append(call)
+            continue
+        parent_id = _coalesce_tool_call_id(call)
+        for index, entry in enumerate(entries):
+            arguments = json.dumps({"calls": [entry]}, ensure_ascii=False)
+            if index == 0:
+                child = copy.deepcopy(call)
+                child.function.arguments = arguments
+            else:
+                child = SimpleNamespace(
+                    id=_deterministic_tool_call_id(_TOOL_CALL_BRIDGE_NAME, parent_id + arguments, index),
+                    type="function",
+                    function=SimpleNamespace(name=_TOOL_CALL_BRIDGE_NAME, arguments=arguments),
+                )
+            expanded.append(child)
+    seen: set[str] = set()
+    for call in expanded:
+        cid = _coalesce_tool_call_id(call)
+        if not cid:
+            continue
+        if cid not in seen:
+            seen.add(cid)
+            continue
+        new_id = next(f"{cid}_d{n}" for n in range(2, len(seen) + 3) if f"{cid}_d{n}" not in seen)
+        seen.add(new_id)
+        try:
+            old = getattr(call, "id", None)
+            call.id = f"{new_id}|{old.split('|', 1)[1]}" if isinstance(old, str) and "|" in old else new_id
+            if getattr(call, "call_id", None):
+                call.call_id = new_id
+        except Exception:
+            pass
+    return expanded
+
+
 def _response_fingerprint(content: str, tool_calls: list[Any]) -> str:
     message: dict[str, Any] = {"role": "assistant", "content": content or ""}
     if tool_calls:
@@ -4712,6 +4834,8 @@ class AntigravityACPClient:
                     "despite failed tool execution; refusing an unsupported PASS. "
                     "Retry the failed tool or report verification incomplete."
                 )
+    
+            tool_calls = _expand_local_tool_call_batches(tool_calls)
     
             tool_bridge_activity = _tool_bridge_activity(
                 active_tools, request_messages, tool_calls
