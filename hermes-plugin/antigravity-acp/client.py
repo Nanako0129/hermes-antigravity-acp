@@ -3867,10 +3867,17 @@ _WARM_IDLE_TTL_SECONDS = float(
     os.environ.get("HERMES_ANTIGRAVITY_ACP_WARM_TTL_SECONDS", "300")
 )
 _SYSTEM_PROMPT_APPEND_ATTR = "_hermes_supports_system_prompt_append"
+# Opt-in: the official server advertises ``systemPrompt.append`` but its semantics are
+# undocumented (docs/official-server-1.4.0-delta.md), and live it is content-sensitive: a real
+# Hermes system band sent this way drew a deterministic Google 429 RESOURCE_EXHAUSTED on every
+# prompt, while the same text inside ``session/prompt`` answered (2026-11-23, server 1.5.2).
+_SYSTEM_PROMPT_APPEND_ENV = "HERMES_ANTIGRAVITY_ACP_SYSTEM_PROMPT_APPEND"
 
 
 def _supports_system_prompt_append(initialize_result: Any) -> bool:
-    """Return True when the ACP server advertises ``_meta.antigravity.systemPrompt.append``."""
+    """True when the operator opted in AND the server advertises ``_meta.antigravity.systemPrompt.append``."""
+    if os.environ.get(_SYSTEM_PROMPT_APPEND_ENV, "").strip() != "1":
+        return False
     if not isinstance(initialize_result, dict):
         return False
     caps = initialize_result.get("agentCapabilities")

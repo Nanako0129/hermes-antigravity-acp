@@ -126,12 +126,21 @@ def _tool_schema(name: str = "read_state") -> dict:
 
 
 def _load_client(
-    monkeypatch, tmp_path: Path, *, supports_sys_append: bool, name_suffix: str
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    supports_sys_append: bool,
+    name_suffix: str,
+    opt_in_sys_append: bool = True,
 ):
     monkeypatch.setenv(
         "HERMES_ANTIGRAVITY_ACP_STATE_FILE",
         str(tmp_path / "acp-conversation-state.json"),
     )
+    if opt_in_sys_append:
+        monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_SYSTEM_PROMPT_APPEND", "1")
+    else:
+        monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_SYSTEM_PROMPT_APPEND", raising=False)
     monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_WORKSPACE", raising=False)
     monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_TRACE", raising=False)
     monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_TRACE_FILE", raising=False)
@@ -285,6 +294,35 @@ def test_system_prompt_append_legacy_fallback_without_capability(
 ) -> None:
     client_mod, client, log_path, _ = _load_client(
         monkeypatch, tmp_path, supports_sys_append=False, name_suffix="legacy_fallback"
+    )
+    try:
+        msgs = [
+            {"role": "system", "content": "CRITICAL_SOUL_MARKER_881"},
+            {"role": "user", "content": "hello user request"},
+        ]
+        client.chat.completions.create(
+            model="fake-model-a", messages=msgs, tools=[_tool_schema()]
+        )
+        rows = _read_rows(log_path)
+        new_row = next(r for r in rows if r["method"] == "session/new")
+        assert new_row["params"]["_meta"] == {"agy": {"disabledTools": ["run_command"]}}
+        wire_user = next(r for r in rows if r["method"] == "session/prompt")["params"]["prompt"][0]["text"]
+        assert "CRITICAL_SOUL_MARKER_881" in wire_user
+        assert "<SYSTEM_INSTRUCTIONS>" in wire_user
+    finally:
+        client_mod._shutdown_warm_pool()
+
+
+def test_system_prompt_append_is_off_by_default_even_when_advertised(
+    monkeypatch, tmp_path
+) -> None:
+    """Advertised but not opted in: the system band stays in session/prompt (live 429 guard)."""
+    client_mod, client, log_path, _ = _load_client(
+        monkeypatch,
+        tmp_path,
+        supports_sys_append=True,
+        name_suffix="sys_append_default_off",
+        opt_in_sys_append=False,
     )
     try:
         msgs = [
