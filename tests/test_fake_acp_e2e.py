@@ -298,8 +298,14 @@ for line in sys.stdin:
                     f"{status}: the current-source research objective remains unresolved; "
                     "no current sources were verified."
                 )
+            elif "reused-call-id-step-2" in text:
+                response = '<tool_call>{"id":"call-1","type":"function","function":{"name":"read_state","arguments":"{\\"path\\":\\"step2\\"}"}}</tool_call>'
+            elif "reused-call-id-step-3" in text:
+                response = "done after reused id"
             else:
                 response = "done after tool result"
+        elif "reused-call-id-step-1" in text:
+            response = '<tool_call>{"id":"call-1","type":"function","function":{"name":"read_state","arguments":"{\\"path\\":\\"step1\\"}"}}</tool_call>'
         elif "inspect" in text:
             response = '<tool_call>{"id":"call-1","type":"function","function":{"name":"read_state","arguments":"{\\"path\\":\\"x\\"}"}}</tool_call>'
         else:
@@ -2136,3 +2142,107 @@ def test_provider_through_mux_to_fake_server_owner_routing(monkeypatch, tmp_path
     assert "native session GC disabled" in selection
     assert "session-gc expired" not in selection
     assert "owner-records" in selection
+
+
+def test_reused_tool_call_id_keeps_native_continuation_delta_without_replay(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """Reused tool_call ids across turns must stay disambiguated in response_fingerprint
+    so subsequent turns stay on continuation_delta instead of hitting frontier_mismatch."""
+    script, log_path = _write_fake_server(tmp_path)
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(script), str(log_path)],
+        cwd=str(tmp_path),
+    )
+    caplog.set_level(logging.INFO)
+    tools = [_tool_schema()]
+
+    turn1_messages = [{"role": "user", "content": "reused-call-id-step-1"}]
+    first = client.chat.completions.create(
+        model="fake-model-a",
+        messages=turn1_messages,
+        tools=tools,
+    )
+    call1 = first.choices[0].message.tool_calls[0]
+    assert call1.id == "call-1"
+
+    turn2_messages = [
+        *turn1_messages,
+        {
+            "role": "assistant",
+            "content": first.choices[0].message.content,
+            "tool_calls": [{
+                "id": call1.id,
+                "type": call1.type,
+                "function": {
+                    "name": call1.function.name,
+                    "arguments": call1.function.arguments,
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": call1.id,
+            "name": call1.function.name,
+            "content": "reused-call-id-step-2",
+        },
+    ]
+    second = client.chat.completions.create(
+        model="fake-model-a",
+        messages=turn2_messages,
+        tools=tools,
+    )
+    call2 = second.choices[0].message.tool_calls[0]
+    assert call2.id == "call-1_d2"
+
+    turn3_messages = [
+        *turn2_messages,
+        {
+            "role": "assistant",
+            "content": second.choices[0].message.content,
+            "tool_calls": [{
+                "id": call2.id,
+                "type": call2.type,
+                "function": {
+                    "name": call2.function.name,
+                    "arguments": call2.function.arguments,
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": call2.id,
+            "name": call2.function.name,
+            "content": "reused-call-id-step-3",
+        },
+    ]
+    third = client.chat.completions.create(
+        model="fake-model-a",
+        messages=turn3_messages,
+        tools=tools,
+    )
+    assert third.choices[0].message.content == "done after reused id"
+
+    continuation_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "ACP continuation: reason=continuation_delta" in record.getMessage()
+    ]
+    assert len(continuation_lines) == 2
+    assert "frontier changed" not in caplog.text
+    assert "frontier_mismatch" not in caplog.text
+
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    prompts = [row for row in rows if row.get("method") == "session/prompt"]
+    assert len(prompts) == 3
+    assert len([row for row in rows if row.get("method") == "session/new"]) == 1
+    assert len([row for row in rows if row.get("method") == "session/resume"]) == 2
+    for prompt_row in prompts[1:]:
+        prompt_text = "".join(
+            block.get("text", "")
+            for block in prompt_row["params"].get("prompt", [])
+            if block.get("type") == "text"
+        )
+        assert "<HISTORICAL_CONTEXT>" not in prompt_text

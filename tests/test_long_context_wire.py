@@ -270,3 +270,72 @@ def test_measured_bytes_are_exact_and_tokens_remain_estimates(monkeypatch):
     # Byte size is exact and reproducible; token size is explicitly an estimate.
     assert measured >= 252_840 + len(REQUEST_MARKER.encode())
     assert 80_000 < estimated_tokens < 95_000  # ~84K scale class, estimate band
+
+
+def test_reused_tool_call_ids_are_uniquified_deterministically_for_continuation(monkeypatch):
+    """Reused model call ids must be disambiguated before response_fingerprint is
+    stored so Hermes' post-response uniquify pass does not trigger frontier_mismatch."""
+    from types import SimpleNamespace
+
+    client = _load_client(monkeypatch)
+    history = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "step 1"},
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        {"role": "user", "content": "step 2"},
+    ]
+    emitted = [
+        SimpleNamespace(
+            id="call_1",
+            type="function",
+            function=SimpleNamespace(name="read_file", arguments='{"path":"a"}'),
+        ),
+        SimpleNamespace(
+            id="call_1",
+            type="function",
+            function=SimpleNamespace(name="read_file", arguments='{"path":"b"}'),
+        ),
+        SimpleNamespace(
+            id="call_fresh|fc_99",
+            type="function",
+            function=SimpleNamespace(name="read_file", arguments='{"path":"c"}'),
+        ),
+    ]
+    client._uniquify_tool_call_ids_against_history(emitted, history)
+    assert [c.id for c in emitted] == ["call_1_d2", "call_1_d3", "call_fresh|fc_99"]
+
+    fingerprint = client._context_fingerprint("fake-model-a", None, None)
+    state = client.ACPConversationState(
+        session_id="s-dedup-test",
+        context_fingerprint=fingerprint,
+        request_fingerprints=tuple(client._message_fingerprint(m) for m in history),
+        response_fingerprint=client._response_fingerprint("", emitted),
+        updated_at=0.0,
+        native_tokens=100,
+    )
+    assistant_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": c.id,
+                "type": c.type,
+                "function": {"name": c.function.name, "arguments": c.function.arguments},
+            }
+            for c in emitted
+        ],
+    }
+    tool_results = [
+        {"role": "tool", "tool_call_id": c.id, "content": "done"}
+        for c in emitted
+    ]
+    delta = client._continuation_delta(history + [assistant_msg, *tool_results], state, fingerprint)
+    assert delta == tool_results

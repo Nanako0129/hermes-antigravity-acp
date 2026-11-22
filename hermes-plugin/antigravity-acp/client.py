@@ -3022,6 +3022,51 @@ def _context_fingerprint(
     return _sha256_text(payload)
 
 
+def _uniquify_tool_call_ids_against_history(
+    tool_calls: list[Any],
+    request_messages: Sequence[dict[str, Any]],
+) -> None:
+    """Pre-empt Hermes message_sanitization ID renames so response_fingerprint stays stable.
+
+    Hermes renames reused tool_call ids (``call_1`` -> ``call_1_d2``) after the
+    client returns, which otherwise breaks ``_continuation_delta`` on the very
+    next turn (``frontier_mismatch`` -> full replay). Matching Hermes' exact
+    deterministic ``<id>_d<n>`` suffix before computing ``response_fingerprint``
+    keeps both sides aligned and preserves prefix determinism.
+    """
+    if not tool_calls:
+        return
+    seen: set[str] = set()
+    for message in request_messages:
+        if not isinstance(message, dict):
+            continue
+        for tc in message.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            raw_id = str(tc.get("call_id") or tc.get("id") or "").strip()
+            if raw_id:
+                seen.add(raw_id.split("|", 1)[0].strip() or raw_id)
+        tool_call_id = str(message.get("tool_call_id") or "").strip()
+        if tool_call_id:
+            seen.add(tool_call_id.split("|", 1)[0].strip() or tool_call_id)
+    for call in tool_calls:
+        raw_id = str(getattr(call, "id", "") or "").strip()
+        if not raw_id:
+            continue
+        cid = raw_id.split("|", 1)[0].strip() or raw_id
+        if cid not in seen:
+            seen.add(cid)
+            continue
+        new_id = next(f"{cid}_d{n}" for n in range(2, len(seen) + 3) if f"{cid}_d{n}" not in seen)
+        seen.add(new_id)
+        try:
+            call.id = f"{new_id}|{raw_id.split('|', 1)[1]}" if "|" in raw_id else new_id
+            if hasattr(call, "call_id") and getattr(call, "call_id", None):
+                call.call_id = new_id
+        except Exception:
+            pass
+
+
 def _response_fingerprint(content: str, tool_calls: list[Any]) -> str:
     message: dict[str, Any] = {"role": "assistant", "content": content or ""}
     if tool_calls:
@@ -4713,6 +4758,8 @@ class AntigravityACPClient:
                     "Retry the failed tool or report verification incomplete."
                 )
     
+            _uniquify_tool_call_ids_against_history(tool_calls, request_messages)
+
             tool_bridge_activity = _tool_bridge_activity(
                 active_tools, request_messages, tool_calls
             )
