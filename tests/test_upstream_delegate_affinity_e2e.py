@@ -264,6 +264,7 @@ def test_parent_and_sibling_children_keep_disjoint_native_continuations(
             child_a_messages = _turn(client, [{"role": "user", "content": "child A task"}], "a-1")
         with delegated_child_context("child-b-1"):
             child_b_messages = _turn(client, [{"role": "user", "content": "child B task"}], "b-1")
+        client_mod._shutdown_warm_pool()
         with delegated_child_context("child-a-1"):
             child_a_messages = _turn(
                 client,
@@ -288,6 +289,7 @@ def test_parent_and_sibling_children_keep_disjoint_native_continuations(
             )
         _turn(client, parent_messages + [{"role": "user", "content": "parent follow-up"}], "parent-2")
     finally:
+        client_mod._shutdown_warm_pool()
         clear_session_vars(tokens)
 
     rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
@@ -415,6 +417,7 @@ def test_nested_delegated_child_uses_its_own_identity_not_inherited_keys(
                 a1_request = [{"role": "user", "content": "nested A1 task"}]
                 a1_messages = _turn(client, a1_request, "n-a1-1")
                 capture("A1", a1_request)
+                client_mod._shutdown_warm_pool()
                 a1_messages = _turn(
                     client,
                     a1_messages + [{"role": "user", "content": "nested A1 follow-up"}],
@@ -432,6 +435,7 @@ def test_nested_delegated_child_uses_its_own_identity_not_inherited_keys(
             with delegated_child_context("grandchild-a1-1"):
                 # Same nested child re-entered in a SEPARATE scope: resumes
                 # A1's own session, not a fresh one.
+                client_mod._shutdown_warm_pool()
                 _turn(
                     client,
                     a1_messages
@@ -454,6 +458,7 @@ def test_nested_delegated_child_uses_its_own_identity_not_inherited_keys(
                 )
             # Child A continues AFTER every nested scope exited: its own
             # continuity must not have been hijacked by A1/A2/ambiguous.
+            client_mod._shutdown_warm_pool()
             _turn(
                 client,
                 a_messages + [{"role": "user", "content": "child A follow-up"}],
@@ -467,6 +472,7 @@ def test_nested_delegated_child_uses_its_own_identity_not_inherited_keys(
             "n-parent-2",
         )
     finally:
+        client_mod._shutdown_warm_pool()
         clear_session_vars(tokens)
 
     state = json.loads(
@@ -739,7 +745,8 @@ def test_concurrent_same_prompt_siblings_never_share_affinity_or_frontier(
         assert_phase_overlap(windows2)
 
         # Phase 3: reverse-order completion with a freshly regenerated client
-        # per request — affinity must survive client lifetime entirely.
+        # and cleared warm pool — affinity must survive client and child lifetime.
+        importlib.import_module("antigravity_acp_delegate_e2e.client")._shutdown_warm_pool()
         for cid in reversed(keyed_ids):
             contexts[cid].run(guarded, cid, f"late turn {cid}", fresh_client(), [])
         assert not failures, failures
@@ -818,7 +825,11 @@ def test_concurrent_same_prompt_siblings_never_share_affinity_or_frontier(
             continue
         assert transport is not None, prompt[:80]
         kind, session_id = transport
-        assert kind == "session/resume", (issuer, transport)
+        expected_kind = (
+            "session/resume" if f"late turn {issuer}" in prompt else "session/new"
+        )
+        assert kind == expected_kind, (issuer, transport)
+        assert row.get("sessionId") == expected_session[issuer], (issuer, row)
         assert session_id == expected_session[issuer], (issuer, transport)
         attributed_resumes.append((issuer, session_id))
 

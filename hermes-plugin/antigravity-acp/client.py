@@ -1375,46 +1375,42 @@ def _log_continuation_diagnostics(
     )
 
 
-def _format_messages_as_prompt(
+def _split_prompt_sections(
     messages: list[dict[str, Any]],
-    model: str | None = None,
+    *,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
-    *,
     unresolved_denied_request: str = "",
-) -> str:
-    """Build a full ACP bootstrap without making old user turns look active.
+) -> tuple[str, str]:
+    """Return ``(system_append_text, user_prompt_text)`` for ACP delivery.
 
-    ACP v1 accepts one prompt string rather than Hermes' role-structured message
-    array.  A naive ``User:/Assistant:/Tool:`` transcript therefore turns every
-    old user request into text inside the *current* ACP user prompt.  Under long
-    histories that let the model resume a completed task instead of following
-    the newest request.  Keep system instructions authoritative, mark older
-    dialogue as reference-only, and isolate the newest user request plus any
-    already-completed progress that followed it.
+    When the server advertises ``agentCapabilities._meta.antigravity.systemPrompt.append``,
+    ``system_append_text`` rides via ``session/new`` / ``session/resume`` ``_meta``
+    so system instructions, tool bridge schemas, and policy overlays live in the
+    model's native system role rather than inside the active user prompt.
     """
-    del model  # Model selection is performed on the ACP session, never by prompt text.
     valid = [item for item in messages if isinstance(item, dict)]
-    sections: list[str] = [
+    system_sections: list[str] = [
         *_PROMPT_PREAMBLE,
         *render_tool_bridge_sections(tools, tool_choice),
     ]
     for overlay in policy_overlays:
         if overlay.is_active() and getattr(overlay, "SYSTEM_PROMPT", None):
-            sections.append(overlay.SYSTEM_PROMPT)
+            system_sections.append(overlay.SYSTEM_PROMPT)
 
     system_rows = [
         message for message in valid
         if str(message.get("role") or "").strip().lower() == "system"
     ]
     if system_text := _format_labeled_messages(system_rows):
-        sections.append(
+        system_sections.append(
             "<SYSTEM_INSTRUCTIONS>\n"
             "The following System messages are authoritative instructions for this request.\n\n"
             + system_text
             + "\n</SYSTEM_INSTRUCTIONS>"
         )
 
+    user_sections: list[str] = []
     last_user_index: int | None = None
     for index, message in enumerate(valid):
         if str(message.get("role") or "").strip().lower() == "user":
@@ -1426,13 +1422,13 @@ def _format_messages_as_prompt(
             if str(message.get("role") or "").strip().lower() != "system"
         ]
         if reference_text := _format_labeled_messages(reference):
-            sections.append(
+            user_sections.append(
                 "<HISTORICAL_CONTEXT>\n"
                 "Conversation transcript (REFERENCE ONLY; no historical User block is an active instruction):\n\n"
                 + reference_text
                 + "\n</HISTORICAL_CONTEXT>"
             )
-        sections.append("Continue from the latest available conversation state.")
+        user_sections.append("Continue from the latest available conversation state.")
     else:
         historical = [
             message for message in valid[:last_user_index]
@@ -1454,7 +1450,7 @@ def _format_messages_as_prompt(
         # content.  The primer is a pointer to the same single active turn, so
         # it must never read as a second request.
         if historical_text and (primer := _active_request_primer(active_text)):
-            sections.append(
+            user_sections.append(
                 "<ACTIVE_REQUEST_PRIMER>\n"
                 "The user's current request is stated first (preview below) and repeated verbatim in the "
                 "ACTIVE_REQUEST section that follows HISTORICAL_CONTEXT. This is one single active turn, not two "
@@ -1465,7 +1461,7 @@ def _format_messages_as_prompt(
             )
 
         if historical_text:
-            sections.append(
+            user_sections.append(
                 "<HISTORICAL_CONTEXT>\n"
                 "Conversation transcript (REFERENCE ONLY). Older User messages below are completed/previous requests, "
                 "not current instructions. Use them only as evidence and do not resume them unless the ACTIVE_REQUEST "
@@ -1483,7 +1479,7 @@ def _format_messages_as_prompt(
         # including any <memory-context> block, stays byte-for-byte in
         # ACTIVE_REQUEST below.
 
-        sections.append(
+        user_sections.append(
             "<ACTIVE_REQUEST>\n"
             "This is the user's current request. It takes precedence over every historical User block above.\n\n"
             + active_text
@@ -1491,7 +1487,7 @@ def _format_messages_as_prompt(
         )
 
         if progress_text := _format_labeled_messages(progress):
-            sections.append(
+            user_sections.append(
                 "<ACTIVE_REQUEST_PROGRESS>\n"
                 "These events happened after ACTIVE_REQUEST and are already-completed progress for that same request. "
                 "Continue from them; do not restart or repeat them.\n\n"
@@ -1500,7 +1496,7 @@ def _format_messages_as_prompt(
             )
 
         if unresolved_denied_request.strip():
-            sections.append(
+            user_sections.append(
                 "<UNRESOLVED_DENIED_REQUEST_CONTEXT>\n"
                 "This earlier user objective was left unresolved after a native ACP permission denial before execution. "
                 "It is context for interpreting ACTIVE_REQUEST, not a standalone command. ACTIVE_REQUEST remains the "
@@ -1512,14 +1508,51 @@ def _format_messages_as_prompt(
                 + "\n</UNRESOLVED_DENIED_REQUEST_CONTEXT>"
             )
 
-        sections.append(
+        user_sections.append(
             "Respond to ACTIVE_REQUEST using the latest state and ACTIVE_REQUEST_PROGRESS. "
             "Do not switch back to, continue, or re-execute an older request merely because it appears in HISTORICAL_CONTEXT."
         )
 
     if _has_completed_tool_history(valid):
-        sections.append(_TOOL_HISTORY_CONTINUATION_NOTE)
-    return "\n\n".join(section.strip() for section in sections if section and section.strip())
+        user_sections.append(_TOOL_HISTORY_CONTINUATION_NOTE)
+
+    system_append_text = "\n\n".join(
+        section.strip() for section in system_sections if section and section.strip()
+    )
+    user_prompt_text = "\n\n".join(
+        section.strip() for section in user_sections if section and section.strip()
+    )
+    return system_append_text, user_prompt_text
+
+
+def _format_messages_as_prompt(
+    messages: list[dict[str, Any]],
+    model: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+    *,
+    unresolved_denied_request: str = "",
+) -> str:
+    """Build a full ACP bootstrap without making old user turns look active.
+
+    ACP v1 accepts one prompt string rather than Hermes' role-structured message
+    array.  A naive ``User:/Assistant:/Tool:`` transcript therefore turns every
+    old user request into text inside the *current* ACP user prompt.  Under long
+    histories that let the model resume a completed task instead of following
+    the newest request.  Keep system instructions authoritative, mark older
+    dialogue as reference-only, and isolate the newest user request plus any
+    already-completed progress that followed it.
+    """
+    del model  # Model selection is performed on the ACP session, never by prompt text.
+    system_append_text, user_prompt_text = _split_prompt_sections(
+        messages,
+        tools=tools,
+        tool_choice=tool_choice,
+        unresolved_denied_request=unresolved_denied_request,
+    )
+    return "\n\n".join(
+        part for part in (system_append_text, user_prompt_text) if part
+    )
 
 
 def _normalized_tool_arguments(arguments: Any) -> str:
@@ -3831,8 +3864,26 @@ POSTPROCESSING_POLICIES = (POSTPROCESSING_POLICY_AGENT, POSTPROCESSING_POLICY_LL
 # ``_active_processes`` so ``close()`` never kills them; ``atexit``, the
 # idle TTL and the per-key pool cap bound their lifetime instead.
 _WARM_IDLE_TTL_SECONDS = float(
-    os.environ.get("HERMES_ANTIGRAVITY_ACP_WARM_TTL_SECONDS", "120")
+    os.environ.get("HERMES_ANTIGRAVITY_ACP_WARM_TTL_SECONDS", "300")
 )
+_SYSTEM_PROMPT_APPEND_ATTR = "_hermes_supports_system_prompt_append"
+
+
+def _supports_system_prompt_append(initialize_result: Any) -> bool:
+    """Return True when the ACP server advertises ``_meta.antigravity.systemPrompt.append``."""
+    if not isinstance(initialize_result, dict):
+        return False
+    caps = initialize_result.get("agentCapabilities")
+    if not isinstance(caps, dict):
+        return False
+    meta = caps.get("_meta")
+    if not isinstance(meta, dict):
+        return False
+    agy = meta.get("antigravity")
+    if not isinstance(agy, dict):
+        return False
+    system_prompt = agy.get("systemPrompt")
+    return isinstance(system_prompt, dict) and system_prompt.get("append") is True
 _WARM_POOL_MAX_PER_KEY = 4
 _warm_pool_lock = threading.Lock()
 # key: (command, args tuple, cwd, affinity key) -> list of parked entries.
@@ -3878,12 +3929,18 @@ def _drain_parked_inbox(inbox: queue.Queue) -> None:
 
     A parked server may still emit trailing notifications/responses after a
     session ends; they must never reach the next session's request loop.
-    Drain until the pipe is quiet for 200ms (bounded to 1s total).
+    Drain buffered lines immediately and enforce a short 20ms quiet window
+    (bounded to 1s total) instead of stalling 200ms on every clean acquire.
     """
+    while True:
+        try:
+            inbox.get_nowait()
+        except queue.Empty:
+            break
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
         try:
-            inbox.get(timeout=0.2)
+            inbox.get(timeout=0.02)
         except queue.Empty:
             return
 
@@ -4118,12 +4175,13 @@ class AntigravityACPClient:
     ) -> dict[str, Any] | None:
         """Pop a live parked process with this launch identity, if any.
 
-        A resume request is never served by a parked process: the resume
-        session id is pinned through the spawn environment
-        (``ACP_MUX_SESSION_ID``) and a parked child was spawned without it.
+        A resume request only reuses a parked child already bound to that
+        exact ``resume_session_id`` (so it already holds the owning account
+        lane and in-memory session state); mismatched or unbound parked
+        children are skipped so a fresh process spawns with
+        ``ACP_MUX_SESSION_ID``.
         """
-        if resume_session_id:
-            return None
+        resume_pin = str(resume_session_id or "").strip()
         key = (self._acp_command, tuple(self._acp_args), self._acp_cwd, affinity_key)
         now = time.monotonic()
         chosen: dict[str, Any] | None = None
@@ -4141,11 +4199,16 @@ class AntigravityACPClient:
                     victims.append(entry)
                     continue
                 if chosen is None:
-                    if current_pin is None:
-                        current_pin = _read_par_pin() or ""
-                    if str(entry.get("par_pin") or "") == current_pin:
-                        chosen = entry
-                        continue
+                    bound_match = (
+                        not resume_pin
+                        or str(entry.get("bound_session_id") or "") == resume_pin
+                    )
+                    if bound_match:
+                        if current_pin is None:
+                            current_pin = _read_par_pin() or ""
+                        if str(entry.get("par_pin") or "") == current_pin:
+                            chosen = entry
+                            continue
                 kept.append(entry)
             if kept:
                 _warm_pool[key] = kept
@@ -4308,12 +4371,14 @@ class AntigravityACPClient:
         context_fingerprint = _context_fingerprint(model, tools, tool_choice)
         prior_state = conversation_registry.get(affinity_key) if affinity_key else None
         denied_request = _denied_request_text(request_messages, prior_state)
-        full_prompt_text = _format_messages_as_prompt(
+        system_append_text, user_prompt_text = _split_prompt_sections(
             request_messages,
-            model=model,
             tools=tools,
             tool_choice=tool_choice,
             unresolved_denied_request=denied_request,
+        )
+        full_prompt_text = "\n\n".join(
+            part for part in (system_append_text, user_prompt_text) if part
         )
 
         resume_session_id = ""
@@ -4441,6 +4506,8 @@ class AntigravityACPClient:
                 affinity_key=affinity_key,
                 resume_session_id=resume_session_id,
                 full_prompt_text=full_prompt_text,
+                system_append_text=system_append_text,
+                user_prompt_text=user_prompt_text,
                 session_result=session_result,
                 native_token_hint=resume_native_token_hint,
                 image_blocks=image_blocks,
@@ -4462,6 +4529,8 @@ class AntigravityACPClient:
                     model=model,
                     affinity_key=affinity_key,
                     full_prompt_text=full_prompt_text,
+                    system_append_text=system_append_text,
+                    user_prompt_text=user_prompt_text,
                     replay_image_blocks=replay_image_blocks,
                     thinking_level=requested_thinking_level,
                     timeout_seconds=timeout_seconds,
@@ -4492,20 +4561,24 @@ class AntigravityACPClient:
                 blocked_name, _ = duplicate_signature
                 correction_tools = _without_openai_tool(active_tools, blocked_name)
                 correction_choice = tool_choice if correction_tools else None
-                correction_base = _format_messages_as_prompt(
+                corr_sys_append, corr_user_base = _split_prompt_sections(
                     request_messages,
-                    model=model,
                     tools=correction_tools,
                     tool_choice=correction_choice,
+                )
+                correction_base = "\n\n".join(
+                    part for part in (corr_sys_append, corr_user_base) if part
                 )
                 for correction_index in range(_MAX_DUPLICATE_NO_PROGRESS_CORRECTIONS):
                     remaining = timeout_seconds - (time.monotonic() - started)
                     if remaining <= 0:
                         break
-                    corrected_prompt = (
-                        f"{correction_base}\n\n{_DUPLICATE_NO_PROGRESS_CORRECTION} "
+                    corr_suffix = (
+                        f"\n\n{_DUPLICATE_NO_PROGRESS_CORRECTION} "
                         f"Blocked tool: {blocked_name}. Correction attempt {correction_index + 1}."
                     )
+                    corrected_prompt = f"{correction_base}{corr_suffix}"
+                    corrected_user_prompt = f"{corr_user_base}{corr_suffix}"
                     correction_result: dict[str, Any] = {}
                     response_text, reasoning = self._run_prompt(
                         corrected_prompt,
@@ -4514,6 +4587,8 @@ class AntigravityACPClient:
                         affinity_key=affinity_key,
                         resume_session_id="",
                         full_prompt_text=corrected_prompt,
+                        system_append_text=corr_sys_append,
+                        user_prompt_text=corrected_user_prompt,
                         session_result=correction_result,
                         image_blocks=replay_image_blocks,
                         replay_image_blocks=replay_image_blocks,
@@ -4528,6 +4603,8 @@ class AntigravityACPClient:
                             model=model,
                             affinity_key=affinity_key,
                             full_prompt_text=corrected_prompt,
+                            system_append_text=corr_sys_append,
+                            user_prompt_text=corrected_user_prompt,
                             replay_image_blocks=replay_image_blocks,
                             thinking_level=requested_thinking_level,
                             timeout_seconds=timeout_seconds,
@@ -4566,10 +4643,12 @@ class AntigravityACPClient:
                     if remaining <= 0:
                         break
                     prior_session_id = str(session_result.get("session_id") or "").strip()
-                    correction_full_prompt = (
-                        f"{full_prompt_text}\n\nPrevious ungrounded review output (not accepted):\n{cleaned_text}"
+                    correction_tail = (
+                        f"\n\nPrevious ungrounded review output (not accepted):\n{cleaned_text}"
                         f"\n\n{_READ_EVIDENCE_CORRECTION}"
                     )
+                    correction_full_prompt = f"{full_prompt_text}{correction_tail}"
+                    correction_user_prompt = f"{user_prompt_text}{correction_tail}"
                     correction_result: dict[str, Any] = {}
                     logger.warning(
                         "Antigravity ACP review response lacked required source-read evidence; "
@@ -4582,6 +4661,8 @@ class AntigravityACPClient:
                         affinity_key=affinity_key,
                         resume_session_id=prior_session_id,
                         full_prompt_text=correction_full_prompt,
+                        system_append_text=system_append_text,
+                        user_prompt_text=correction_user_prompt,
                         session_result=correction_result,
                         image_blocks=(),
                         replay_image_blocks=replay_image_blocks,
@@ -4596,6 +4677,8 @@ class AntigravityACPClient:
                             model=model,
                             affinity_key=affinity_key,
                             full_prompt_text=correction_full_prompt,
+                            system_append_text=system_append_text,
+                            user_prompt_text=correction_user_prompt,
                             replay_image_blocks=replay_image_blocks,
                             thinking_level=requested_thinking_level,
                             timeout_seconds=timeout_seconds,
@@ -4646,10 +4729,12 @@ class AntigravityACPClient:
                         f"{_ARTIFACT_CLAIM_CORRECTION}\n\n"
                         f"Fresh filesystem verification says these claimed paths are missing:\n{missing_lines}"
                     )
-                    correction_full_prompt = (
-                        f"{full_prompt_text}\n\nPrevious final answer (not accepted):\n{cleaned_text}"
+                    correction_tail = (
+                        f"\n\nPrevious final answer (not accepted):\n{cleaned_text}"
                         f"\n\n{correction_prompt}"
                     )
+                    correction_full_prompt = f"{full_prompt_text}{correction_tail}"
+                    correction_user_prompt = f"{user_prompt_text}{correction_tail}"
                     prior_session_id = str(session_result.get("session_id") or "").strip()
                     correction_result: dict[str, Any] = {}
                     logger.warning(
@@ -4664,6 +4749,8 @@ class AntigravityACPClient:
                         affinity_key=affinity_key,
                         resume_session_id=prior_session_id,
                         full_prompt_text=correction_full_prompt,
+                        system_append_text=system_append_text,
+                        user_prompt_text=correction_user_prompt,
                         session_result=correction_result,
                         image_blocks=(),
                         replay_image_blocks=replay_image_blocks,
@@ -4678,6 +4765,8 @@ class AntigravityACPClient:
                             model=model,
                             affinity_key=affinity_key,
                             full_prompt_text=correction_full_prompt,
+                            system_append_text=system_append_text,
+                            user_prompt_text=correction_user_prompt,
                             replay_image_blocks=replay_image_blocks,
                             thinking_level=requested_thinking_level,
                             timeout_seconds=timeout_seconds,
@@ -4975,6 +5064,7 @@ class AntigravityACPClient:
         resume_session_id: str = "",
         activity_stats_out: dict[str, Any] | None = None,
         strict_same_session: bool = False,
+        system_append_text: str = "",
     ) -> Iterator[tuple[dict[str, Any], Callable[..., Any], dict[str, Any]]]:
         resume_session_id = str(resume_session_id or "").strip()
         # Snapshot the cancellation epoch (issue #23): this session aborts when
@@ -5033,6 +5123,11 @@ class AntigravityACPClient:
                     self._acp_cwd,
                     affinity_key,
                 ),
+                "bound_session_id": "",
+                "session_snapshot": None,
+                "session_meta_fingerprint": "",
+                "selected_requested_model": "",
+                "effective_model": "",
             }
         proc = entry["proc"]
         inbox = entry["inbox"]
@@ -5371,6 +5466,11 @@ class AntigravityACPClient:
                     _USAGE_SEMANTICS_ATTR,
                     _usage_semantics_from_initialize(initialize_result),
                 )
+                setattr(
+                    proc,
+                    _SYSTEM_PROMPT_APPEND_ATTR,
+                    _supports_system_prompt_append(initialize_result),
+                )
                 # The activity_stats seed above ran before this handshake on a
                 # fresh connection; refresh it with the pinned identity.
                 activity_stats[_SERVER_CONSUMPTION_SEMANTICS_KEY] = str(
@@ -5380,8 +5480,47 @@ class AntigravityACPClient:
             # Hermes model-provider mode always disables the native
             # run_command built-in at launch; shell work belongs to Hermes'
             # approval-gated terminal tool through the <tool_call> bridge.
-            session_meta = {"agy": {"disabledTools": ["run_command"]}}
-            if resume_session_id:
+            supports_system_prompt_append = bool(
+                getattr(proc, _SYSTEM_PROMPT_APPEND_ATTR, False)
+            )
+            session_meta: dict[str, Any] = {
+                "agy": {"disabledTools": ["run_command"]}
+            }
+            clean_system_append = str(system_append_text or "").strip()
+            if supports_system_prompt_append and clean_system_append:
+                session_meta["antigravity"] = {
+                    "systemPrompt": {"append": clean_system_append}
+                }
+            session_meta_fp = hashlib.sha256(
+                json.dumps(
+                    session_meta,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            can_reuse_warm_session = bool(
+                not fresh
+                and not strict_same_session
+                and resume_session_id
+                and str(entry.get("bound_session_id") or "") == resume_session_id
+                and isinstance(entry.get("session_snapshot"), dict)
+                and str(entry.get("session_meta_fingerprint") or "") == session_meta_fp
+            )
+            session_branch = "resume" if resume_session_id else "new"
+            if can_reuse_warm_session:
+                session = dict(entry["session_snapshot"])
+                session["sessionId"] = resume_session_id
+                session["_hermes_resumed"] = True
+                session["_hermes_warm_same_session"] = True
+                session["_hermes_warm_selected_model"] = str(
+                    entry.get("selected_requested_model") or ""
+                )
+                session["_hermes_warm_effective_model"] = str(
+                    entry.get("effective_model") or ""
+                )
+                session_branch = "warm_reuse"
+            elif resume_session_id:
                 resume_params: dict[str, Any] = {
                     "sessionId": resume_session_id,
                     "cwd": self._acp_cwd,
@@ -5410,6 +5549,15 @@ class AntigravityACPClient:
                         "session/prompt to an unconfirmed session."
                     )
                 session.setdefault("sessionId", resume_session_id)
+                entry["bound_session_id"] = str(session["sessionId"]).strip()
+                entry["session_snapshot"] = {
+                    k: v
+                    for k, v in session.items()
+                    if not str(k).startswith("_hermes_")
+                }
+                entry["session_meta_fingerprint"] = session_meta_fp
+                entry["selected_requested_model"] = ""
+                entry["effective_model"] = ""
                 session["_hermes_resumed"] = True
             else:
                 new_params: dict[str, Any] = {
@@ -5419,15 +5567,29 @@ class AntigravityACPClient:
                 if session_meta is not None:
                     new_params["_meta"] = session_meta
                 session = request("session/new", new_params) or {}
+                session = dict(session)
+                new_sid = str(session.get("sessionId") or "").strip()
+                if new_sid:
+                    entry["bound_session_id"] = new_sid
+                    entry["session_snapshot"] = {
+                        k: v
+                        for k, v in session.items()
+                        if not str(k).startswith("_hermes_")
+                    }
+                    entry["session_meta_fingerprint"] = session_meta_fp
+                    entry["selected_requested_model"] = ""
+                    entry["effective_model"] = ""
             if not str(session.get("sessionId") or "").strip():
                 raise RuntimeError("Antigravity ACP did not return a sessionId.")
+            session["_hermes_warm_entry"] = entry
+            session["_hermes_supports_system_prompt_append"] = supports_system_prompt_append
             if trace is not None:
                 self._trace_event(
                     "session_new_or_resume",
                     req_key=attempt_key,
                     pid=proc.pid,
                     detail={
-                        "branch": "resume" if resume_session_id else "new",
+                        "branch": session_branch,
                         "session_id_hash": _opaque_permission_id(
                             session.get("sessionId"), "session"
                         ),
@@ -5512,6 +5674,8 @@ class AntigravityACPClient:
         timeout_seconds: float,
         started: float,
         reasoning: str = "",
+        system_append_text: str = "",
+        user_prompt_text: str | None = None,
     ) -> tuple[list[Any], str, dict[str, Any], str, int]:
         """Extract advertised tool calls, correcting malformed envelopes in-session.
 
@@ -5593,9 +5757,15 @@ class AntigravityACPClient:
                     "retry_attempt",
                     detail={"reason": "malformed_correction", "attempt": corrections},
                 )
-                correction_full_prompt = (
-                    f"{full_prompt_text}\n\nPrevious malformed model output (not executed):\n{response_text}"
+                correction_tail = (
+                    f"\n\nPrevious malformed model output (not executed):\n{response_text}"
                     f"\n\n{_MALFORMED_TOOL_CALL_CORRECTION}"
+                )
+                correction_full_prompt = f"{full_prompt_text}{correction_tail}"
+                correction_user_prompt = (
+                    f"{user_prompt_text}{correction_tail}"
+                    if user_prompt_text is not None
+                    else None
                 )
                 correction_result: dict[str, Any] = {}
                 logger.warning(
@@ -5612,6 +5782,8 @@ class AntigravityACPClient:
                     affinity_key=affinity_key,
                     resume_session_id=prior_session_id,
                     full_prompt_text=correction_full_prompt,
+                    system_append_text=system_append_text,
+                    user_prompt_text=correction_user_prompt,
                     session_result=correction_result,
                     image_blocks=(),
                     replay_image_blocks=replay_image_blocks,
@@ -5641,6 +5813,8 @@ class AntigravityACPClient:
         affinity_key: str = "",
         resume_session_id: str = "",
         full_prompt_text: str | None = None,
+        system_append_text: str = "",
+        user_prompt_text: str | None = None,
         session_result: dict[str, Any] | None = None,
         native_token_hint: int = 0,
         image_blocks: tuple[dict[str, str], ...] = (),
@@ -5670,6 +5844,8 @@ class AntigravityACPClient:
                 affinity_key=affinity_key,
                 resume_session_id=resume_session_id,
                 full_prompt_text=full_prompt_text,
+                system_append_text=system_append_text,
+                user_prompt_text=user_prompt_text,
                 session_result=session_result,
                 native_token_hint=native_token_hint,
                 image_blocks=image_blocks,
@@ -5689,6 +5865,8 @@ class AntigravityACPClient:
         affinity_key: str = "",
         resume_session_id: str = "",
         full_prompt_text: str | None = None,
+        system_append_text: str = "",
+        user_prompt_text: str | None = None,
         session_result: dict[str, Any] | None = None,
         native_token_hint: int = 0,
         image_blocks: tuple[dict[str, str], ...] = (),
@@ -5698,8 +5876,10 @@ class AntigravityACPClient:
     ) -> tuple[str, str]:
         deadline = time.monotonic() + timeout_seconds
         replay_text = full_prompt_text or prompt_text
+        replay_user_text = user_prompt_text
         next_text = prompt_text
         next_resume = str(resume_session_id or "").strip()
+        next_is_full_replay = not bool(next_resume)
         if strict_same_session and not next_resume:
             raise RuntimeError(
                 "Antigravity ACP strict same-session recovery refused: no session id "
@@ -5723,6 +5903,10 @@ class AntigravityACPClient:
                     thinking_level=thinking_level,
                     affinity_key=affinity_key,
                     resume_session_id=next_resume,
+                    system_append_text=system_append_text,
+                    user_prompt_text=(
+                        replay_user_text if next_is_full_replay else None
+                    ),
                     session_result=session_result,
                     activity_out=attempt_activity,
                     image_blocks=next_image_blocks,
@@ -5783,6 +5967,7 @@ class AntigravityACPClient:
                     )
                     next_text = replay_text
                     next_resume = ""
+                    next_is_full_replay = True
                     next_image_blocks = replay_image_blocks
                     resume_miss_replayed = True
                     continue
@@ -5828,6 +6013,7 @@ class AntigravityACPClient:
                 )
                 next_text = replay_text
                 next_resume = ""
+                next_is_full_replay = True
                 next_image_blocks = replay_image_blocks
                 continue
             if strict_same_session:
@@ -5854,6 +6040,8 @@ class AntigravityACPClient:
         model: str | None = None,
         affinity_key: str = "",
         resume_session_id: str = "",
+        system_append_text: str = "",
+        user_prompt_text: str | None = None,
         session_result: dict[str, Any] | None = None,
         activity_out: dict[str, Any] | None = None,
         image_blocks: tuple[dict[str, str], ...] = (),
@@ -5867,15 +6055,23 @@ class AntigravityACPClient:
             resume_session_id=resume_session_id,
             activity_stats_out=activity_out,
             strict_same_session=strict_same_session,
+            system_append_text=system_append_text,
         ) as (session, request, activity_stats):
             session_id = str(session.get("sessionId") or "").strip()
             resumed = bool(session.get("_hermes_resumed"))
+            warm_same_session = bool(session.get("_hermes_warm_same_session"))
+            warm_selected_model = str(session.get("_hermes_warm_selected_model") or "")
+            warm_effective_model = str(session.get("_hermes_warm_effective_model") or "")
             persisted_model = ""
             if resumed and affinity_key:
                 prior_state = conversation_registry.get(affinity_key)
                 if prior_state is not None and prior_state.session_id == session_id:
                     persisted_model = prior_state.effective_model
-            current_model = _session_current_model(session)
+            current_model = (
+                warm_effective_model or _session_current_model(session)
+                if warm_same_session
+                else _session_current_model(session)
+            )
             if resumed and not (current_model or persisted_model):
                 # Integrity guard: never claim a model we cannot verify. One
                 # escape hatch: when the offered surface still authorizes the
@@ -5908,7 +6104,21 @@ class AntigravityACPClient:
                 if current_model
                 else "session_default_unreported"
             )
-            if requested_model and requested_model != "antigravity-acp":
+            warm_model_preserved = bool(
+                warm_same_session
+                and warm_effective_model
+                and (
+                    requested_model == warm_selected_model
+                    or (
+                        (not requested_model or requested_model == "antigravity-acp")
+                        and warm_selected_model in ("", "antigravity-acp")
+                    )
+                )
+            )
+            if warm_model_preserved:
+                effective_model = warm_effective_model
+                model_selection_outcome = "warm_session_model_preserved"
+            elif requested_model and requested_model != "antigravity-acp":
                 if resumed:
                     offered_models = _session_model_ids(session)
                     if offered_models and requested_model not in offered_models:
@@ -6019,6 +6229,10 @@ class AntigravityACPClient:
                         else:
                             effective_model = requested_model
                             model_selection_outcome = "requested_option_accepted"
+            warm_entry = session.get("_hermes_warm_entry")
+            if isinstance(warm_entry, dict) and not warm_model_preserved:
+                warm_entry["selected_requested_model"] = requested_model
+                warm_entry["effective_model"] = str(effective_model or "")
             logger.info(
                 "ACP model selection: conversation=%s requested_model=%s "
                 "effective_model=%s outcome=%s",
@@ -6083,6 +6297,15 @@ class AntigravityACPClient:
             # resource_link is a pathname, so this only narrows (does not
             # eliminate) the server-open TOCTOU window.
             wire_media_blocks = _wire_media_blocks(image_blocks)
+            effective_prompt_text = (
+                user_prompt_text
+                if (
+                    session.get("_hermes_supports_system_prompt_append")
+                    and system_append_text.strip()
+                    and user_prompt_text is not None
+                )
+                else prompt_text
+            )
             try:
                 prompt_result = request(
                     "session/prompt",
@@ -6092,7 +6315,7 @@ class AntigravityACPClient:
                         # context for the question that follows.
                         "prompt": [
                             *wire_media_blocks,
-                            {"type": "text", "text": prompt_text},
+                            {"type": "text", "text": effective_prompt_text},
                         ],
                     },
                     text_parts=text_parts,

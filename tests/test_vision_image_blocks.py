@@ -721,13 +721,15 @@ def test_resume_miss_replays_active_turn_images(monkeypatch, tmp_path) -> None:
     script.write_text(
         f"REC = {str(rec)!r}\n" + FAKE_RESUME_MISS, encoding="utf-8"
     )
-    client = _load_client(
+    client, client_mod = _load_client_and_module(
         monkeypatch, args=[str(script)], cwd=str(tmp_path), retries=0
     )
     user = {"role": "user", "content": "Inspect the screenshot."}
     client.chat.completions.create(
         model="antigravity-acp", messages=[user], timeout=10,
     )
+    # Clear the warm pool so turn 2 spawns cold and exercises session/resume -> resume_miss.
+    client_mod._shutdown_warm_pool()
     with_image = [
         user,
         {"role": "assistant", "content": "ok-vision"},

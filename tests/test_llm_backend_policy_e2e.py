@@ -515,6 +515,7 @@ def test_mixed_default_and_backend_clients_do_not_contaminate_each_other(
             "content": '{"value":1}',
         },
     ]
+    client_module._shutdown_warm_pool()
     default_second = default_client.chat.completions.create(
         model="fake-model-a", messages=second_messages, tools=tools
     )

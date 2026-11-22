@@ -330,9 +330,9 @@ def test_verified_session_sequence_counts_only_real_consumption(
         model="model-a", messages=[{"role": "user", "content": "hi"}], timeout=10,
     )
     assert first.choices[0].message.content == "ok-seq"
-    # Same conversation AND same model: the adapter resumes the native
-    # session (a model change would deliberately rotate to a fresh session).
-    # The resume response carries the simulated out-of-window re-report.
+    # Same conversation AND same model: force a cold process resume so the
+    # fake server's session/resume handler emits the out-of-window re-report.
+    client_module._shutdown_warm_pool()
     second = client.chat.completions.create(
         model="model-a",
         messages=[

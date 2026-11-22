@@ -855,6 +855,25 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
     )
     assert second.antigravity_usage_telemetry["turn_id_hash"] != first.antigravity_usage_telemetry["turn_id_hash"]
 
+    # Warm same-session reuse keeps the parked process alive across second's
+    # continuation hop (no extra initialize / session/resume), while clearing
+    # the warm pool forces a cold cross-process session/resume with pin env.
+    rows_warm = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [r["method"] for r in rows_warm].count("session/resume") == 0
+
+    importlib.import_module("antigravity_acp_fake_e2e.client")._shutdown_warm_pool()
+    third_messages = [
+        *second_messages,
+        {"role": "assistant", "content": second.choices[0].message.content},
+        {"role": "user", "content": "follow up after restart"},
+    ]
+    third = client.chat.completions.create(
+        model="fake-model-a",
+        messages=third_messages,
+        tools=tools,
+    )
+    assert third.choices[0].message.content == "normal response"
+
     rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     methods = [row["method"] for row in rows]
     assert "session/new" in methods
@@ -2090,7 +2109,8 @@ def test_provider_through_mux_to_fake_server_owner_routing(monkeypatch, tmp_path
     )
     call = first.choices[0].message.tool_calls[0]
 
-    # Simulate long-running-worker affinity eviction between turns.
+    # Simulate long-running-worker affinity eviction and worker restart between turns.
+    client_mod._shutdown_warm_pool()
     state = json.loads(mux_state.read_text())
     assert state["affinities"]
     state["affinities"] = {}
