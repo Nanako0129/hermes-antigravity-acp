@@ -14,6 +14,7 @@ an error answer for a call it is still waiting on.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import http.server
 import json
@@ -22,6 +23,7 @@ import socketserver
 import threading
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -29,6 +31,21 @@ DEFAULT_DEADLINE_SECONDS = 170.0  # agy's own MCP tools/call limit is 180 s (mea
 _SOCKET_TIMEOUT = 30.0  # L4: bounds slow-read clients; does not limit a parked wait
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 _DROP = object()  # sentinel: close the HTTP connection without a JSON-RPC result
+_MAX_COMPLETED_CACHE = 32
+_MAX_COMPLETED_BYTES = 8 * 1024 * 1024
+
+
+@dataclass
+class _CompletedCall:
+    name: str
+    text: str
+    is_error: bool
+    images: list[tuple[str, str]]
+    seq: int
+    size_bytes: int
+    delivery_ok: bool = False
+    delivery_failed: bool = False
+    inflight_sends: int = 0
 
 
 def _canonical_signature(name: str, arguments: dict[str, Any]) -> str:
@@ -52,6 +69,8 @@ class ParkedCall:
         self.is_error = False
         self.images: list[tuple[str, str]] = []  # (mimeType, base64) sent as MCP image content
         self.drop_connection = False
+        self._epoch: int = 0
+        self._completed_entry: _CompletedCall | None = None
         self._lock = threading.Lock()
         self._done = threading.Event()
 
@@ -60,8 +79,9 @@ class ParkedCall:
         with self._lock:
             if self.state != "parked":
                 return False
-            self.state, self.text, self.is_error, self.drop_connection = state, text, is_error, drop
+            self.text, self.is_error, self.drop_connection = text, is_error, drop
             self.images = list(images or [])
+            self.state = state
         self._done.set()
         return True
 
@@ -108,7 +128,11 @@ class ParkedMcpServer:
         self._on_deadline = on_deadline
         self._deadline = deadline
         self._lock = threading.Lock()
-        self._live: dict[str, ParkedCall] = {}  # signature -> call parked or handed out
+        self._live: dict[bytes, ParkedCall] = {}  # sha256(signature) -> call parked or handed out
+        self._completed: dict[bytes, _CompletedCall] = {}  # sha256(signature) -> answered call awaiting ACP completion
+        self._completed_bytes: int = 0
+        self._completed_seq: int = 0
+        self._epoch: int = 0
         self._retired = False
         self._httpd: _LoopbackHTTPServer | None = None
 
@@ -135,6 +159,41 @@ class ParkedMcpServer:
         """Every later ``tools/call`` gets ``isError`` at once and is never parked."""
         with self._lock:
             self._retired = True
+            self._completed.clear()
+            self._completed_bytes = 0
+            self._epoch += 1
+
+    def mark_completed(self, tool_name: str) -> bool:
+        """Evict the oldest completed entry for ``tool_name`` once ACP reports it completed."""
+        with self._lock:
+            tier1 = [
+                (k, e)
+                for k, e in self._completed.items()
+                if e.name == tool_name and e.delivery_ok and not e.delivery_failed
+            ]
+            candidates = tier1 or [
+                (k, e)
+                for k, e in self._completed.items()
+                if e.name == tool_name and not e.delivery_failed
+            ]
+            if not candidates:
+                return False
+            sig_key, entry = min(candidates, key=lambda item: item[1].seq)
+            del self._completed[sig_key]
+            self._completed_bytes = max(0, self._completed_bytes - entry.size_bytes)
+            return True
+
+    def clear_completed(self, *, preserve_parked: bool = False) -> None:
+        """Flush cached completed answers and advance the cache epoch."""
+        with self._lock:
+            self._completed.clear()
+            self._completed_bytes = 0
+            self._epoch += 1
+            if preserve_parked:
+                for call in self._live.values():
+                    with call._lock:
+                        if call.state == "parked":
+                            call._epoch = self._epoch
 
     def release_parked(self, reason: str = "superseded", *, drop_connection: bool = True) -> None:
         """Release every live call: drop its HTTP connection without a result, or answer isError."""
@@ -222,11 +281,31 @@ class ParkedMcpServer:
                 if msg.get("id") is None:  # notification
                     self._send(202)
                     return
-                response = bridge._handle_rpc(msg["id"], msg.get("method"), msg.get("params"))
+                response, sig_key, entry = bridge._dispatch_rpc(msg["id"], msg.get("method"), msg.get("params"))
                 if response is _DROP:
                     self.close_connection = True
                     return
-                self._send(200, response)
+                if entry is None:
+                    try:
+                        self._send(200, response)
+                    except OSError:
+                        self.close_connection = True
+                else:
+                    succeeded = False
+                    try:
+                        self._send(200, response)
+                        succeeded = True
+                    except OSError:
+                        self.close_connection = True
+                    finally:
+                        with bridge._lock:
+                            entry.inflight_sends = max(0, entry.inflight_sends - 1)
+                            if sig_key is not None and bridge._completed.get(sig_key) is entry:
+                                if succeeded:
+                                    entry.delivery_ok = True
+                                    entry.delivery_failed = False
+                                elif not entry.delivery_ok and entry.inflight_sends == 0:
+                                    entry.delivery_failed = True
 
         self._httpd = _LoopbackHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(
@@ -237,47 +316,76 @@ class ParkedMcpServer:
     # -- JSON-RPC ------------------------------------------------------------------
 
     def _handle_rpc(self, req_id: Any, method: Any, params: Any) -> Any:
+        return self._dispatch_rpc(req_id, method, params)[0]
+
+    def _dispatch_rpc(
+        self, req_id: Any, method: Any, params: Any
+    ) -> tuple[Any, bytes | None, _CompletedCall | None]:
         if method == "initialize":
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": self.server_name, "version": "0.1.0"},
+            return (
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {"tools": {"listChanged": False}},
+                        "serverInfo": {"name": self.server_name, "version": "0.1.0"},
+                    },
                 },
-            }
+                None,
+                None,
+            )
         if method == "ping":
-            return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+            return {"jsonrpc": "2.0", "id": req_id, "result": {}}, None, None
         if method == "tools/list":
             tools = [
                 {"description": "", "inputSchema": {"type": "object", "properties": {}}, **t}
                 for t in self._tools.values()
             ]
-            return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}}
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}}, None, None
         if method == "tools/call":
-            return self._handle_tool_call(req_id, params)
-        return _rpc_error(req_id, -32601, f"Method not found: {method}")
+            return self._handle_tool_call_with_ref(req_id, params)
+        return _rpc_error(req_id, -32601, f"Method not found: {method}"), None, None
 
-    def _handle_tool_call(self, req_id: Any, params: Any) -> Any:
+    def _handle_tool_call_with_ref(
+        self, req_id: Any, params: Any
+    ) -> tuple[Any, bytes | None, _CompletedCall | None]:
         if not isinstance(params, dict):
-            return _rpc_error(req_id, -32602, "Invalid params")
+            return _rpc_error(req_id, -32602, "Invalid params"), None, None
         name = str(params.get("name") or "").strip()
         arguments = params.get("arguments")
         arguments = {} if arguments is None else arguments
         if not isinstance(arguments, dict):
-            return _rpc_error(req_id, -32602, "Tool arguments must be an object")
+            return _rpc_error(req_id, -32602, "Tool arguments must be an object"), None, None
         if name not in self._tools:
-            return _rpc_error(req_id, -32602, f"Undeclared tool: {name}")
+            return _rpc_error(req_id, -32602, f"Undeclared tool: {name}"), None, None
 
         signature = _canonical_signature(name, arguments)
+        sig_key = hashlib.sha256(signature.encode("utf-8")).digest()
         with self._lock:
             if self._retired:
-                return _tool_result(req_id, "session retired", True)
-            call = self._live.get(signature)  # M3: same signature shares the parked call
-            fresh = call is None or call.state != "parked"
+                return _tool_result(req_id, "session retired", True), None, None
+            if (cached := self._completed.get(sig_key)) is not None:
+                cached.inflight_sends += 1
+                cached.delivery_ok = False
+                cached.delivery_failed = False
+                return _tool_result(req_id, cached.text, cached.is_error, cached.images), sig_key, cached
+            call = self._live.get(sig_key)  # M3: same signature shares the parked call
+            if call is not None:
+                with call._lock:
+                    reusable = call.state == "parked" or (
+                        call.state == "answered"
+                        and not call.is_error
+                        and not call.drop_connection
+                        and call._epoch == self._epoch
+                    )
+            else:
+                reusable = False
+            fresh = not reusable
             if fresh:
-                call = self._live[signature] = ParkedCall(name, arguments)
+                call = ParkedCall(name, arguments)
+                call._epoch = self._epoch
+                self._live[sig_key] = call
             assert call is not None
         if fresh:
             try:
@@ -289,9 +397,50 @@ class ParkedMcpServer:
         ):
             if self._on_deadline:
                 self._on_deadline(call)
+        completed_ref: tuple[bytes | None, _CompletedCall | None] = (None, None)
         with self._lock:
-            if self._live.get(signature) is call:
-                del self._live[signature]
+            if self._live.get(sig_key) is call:
+                del self._live[sig_key]
+                if (
+                    call.state == "answered"
+                    and not call.is_error
+                    and not call.drop_connection
+                    and not self._retired
+                    and call._epoch == self._epoch
+                ):
+                    size_bytes = len(call.text.encode("utf-8")) + sum(
+                        len(m.encode("utf-8")) + len(d.encode("utf-8")) for m, d in call.images
+                    )
+                    if size_bytes <= _MAX_COMPLETED_BYTES:
+                        self._completed_seq += 1
+                        entry = _CompletedCall(
+                            name=name,
+                            text=call.text,
+                            is_error=call.is_error,
+                            images=list(call.images),
+                            seq=self._completed_seq,
+                            size_bytes=size_bytes,
+                            inflight_sends=1,
+                        )
+                        if (old := self._completed.pop(sig_key, None)) is not None:
+                            self._completed_bytes -= old.size_bytes
+                        self._completed[sig_key] = entry
+                        self._completed_bytes += size_bytes
+                        while (
+                            len(self._completed) > _MAX_COMPLETED_CACHE
+                            or self._completed_bytes > _MAX_COMPLETED_BYTES
+                        ):
+                            oldest_key = min(self._completed, key=lambda k: self._completed[k].seq)
+                            evicted = self._completed.pop(oldest_key)
+                            self._completed_bytes -= evicted.size_bytes
+                        call._completed_entry = entry
+                        completed_ref = (sig_key, entry)
+            else:
+                entry = call._completed_entry
+                if entry is not None and self._completed.get(sig_key) is entry:
+                    entry.inflight_sends += 1
+                    entry.delivery_failed = False
+                    completed_ref = (sig_key, entry)
         if call.drop_connection:
-            return _DROP
-        return _tool_result(req_id, call.text, call.is_error, call.images)
+            return _DROP, None, None
+        return _tool_result(req_id, call.text, call.is_error, call.images), completed_ref[0], completed_ref[1]

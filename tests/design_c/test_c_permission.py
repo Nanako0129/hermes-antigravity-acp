@@ -1,3 +1,6 @@
+import threading
+from collections import Counter
+
 from antigravity_acp_mcp.permission import PermissionGate
 
 SERVER = "hermes-deadbeef"
@@ -68,3 +71,103 @@ def test_permission_request_registers_the_call_as_ours():
     g.decide(request(meta()))
     g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "t1", "status": "in_progress"})
     assert seen == []
+
+
+def test_our_tool_completed_callback_on_followup_and_single_frame():
+    completed, foreign = [], []
+    g = gate(on_foreign_tool_call=foreign.append, on_our_tool_completed=completed.append)
+    # 1) _our_meta on tool_call, followed by tool_call_update(completed) without _meta.
+    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "c1", "status": "in_progress",
+                      "_meta": meta(tool="terminal")})
+    assert completed == []
+    g.observe_update({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"})
+    assert completed == ["terminal"] and foreign == []
+
+    # 2) Registered via decide() then completed via tool_call_update without _meta.
+    g.decide(request(meta(tool="read_file")))
+    g.observe_update({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed"})
+    assert completed == ["terminal", "read_file"] and foreign == []
+
+    # 3) Single-frame _our_meta + completed.
+    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "s1", "status": "completed",
+                      "_meta": meta(tool="read_file")})
+    assert completed == ["terminal", "read_file", "read_file"] and foreign == []
+
+
+def test_duplicate_completed_is_idempotent_and_failed_does_not_fire():
+    completed, foreign = [], []
+    g = gate(on_foreign_tool_call=foreign.append, on_our_tool_completed=completed.append)
+    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "c1", "status": "in_progress", "_meta": meta()})
+    g.observe_update({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"})
+    g.observe_update({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"})
+    g.observe_update({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed", "_meta": meta()})
+    assert completed == ["terminal"] and foreign == []
+
+    # status="failed" never fires on_our_tool_completed.
+    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "f1", "status": "in_progress", "_meta": meta()})
+    g.observe_update({"sessionUpdate": "tool_call_update", "toolCallId": "f1", "status": "failed"})
+    assert completed == ["terminal"] and foreign == []
+
+
+def test_empty_call_id_does_not_disable_h1_or_fire_completion():
+    completed, foreign = [], []
+    g = gate(on_foreign_tool_call=foreign.append, on_our_tool_completed=completed.append)
+    # Empty/missing toolCallId with our _meta must not register "" in _ours or fire completion (SEC-M3-6).
+    g.decide({
+        "toolCall": {"toolCallId": "", "title": "terminal", "_meta": meta()},
+        "options": [{"optionId": "opt-allow_once", "name": "allow_once", "kind": "allow_once"}],
+    })
+    g.observe_update({"sessionUpdate": "tool_call", "toolCallId": "", "status": "completed", "_meta": meta()})
+    g.observe_update({"sessionUpdate": "tool_call", "status": "completed", "_meta": meta()})
+    assert completed == [] and foreign == []
+
+    # Foreign tool with empty/missing toolCallId still trips H1.
+    f1 = {"sessionUpdate": "tool_call", "toolCallId": "", "status": "in_progress", "title": "view_file"}
+    f2 = {"sessionUpdate": "tool_call_update", "status": "completed", "title": "run_command"}
+    g.observe_update(f1)
+    g.observe_update(f2)
+    assert foreign == [f1, f2] and completed == []
+
+
+def test_concurrent_decide_and_observe_update_thread_safety():
+    completed, foreign = [], []
+    cb_lock = threading.Lock()
+
+    def on_done(tool_name):
+        with cb_lock:
+            completed.append(tool_name)
+
+    g = gate(on_foreign_tool_call=foreign.append, on_our_tool_completed=on_done)
+    n_ids = 120
+    barrier = threading.Barrier(4)
+    errors = []
+
+    def worker(offset, tool_name):
+        try:
+            barrier.wait(5)
+            for i in range(n_ids):
+                cid = f"cid-{offset}-{i}"
+                g.decide({
+                    "toolCall": {"toolCallId": cid, "title": tool_name, "_meta": meta(tool=tool_name)},
+                    "options": [{"optionId": "opt-allow_once", "name": "allow_once", "kind": "allow_once"}],
+                })
+                g.observe_update({"sessionUpdate": "tool_call", "toolCallId": cid, "status": "in_progress",
+                                  "_meta": meta(tool=tool_name)})
+                g.observe_update({"sessionUpdate": "tool_call_update", "toolCallId": cid, "status": "completed"})
+                g.observe_update({"sessionUpdate": "tool_call_update", "toolCallId": cid, "status": "completed"})
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(0, "terminal")),
+        threading.Thread(target=worker, args=(1, "read_file")),
+        threading.Thread(target=worker, args=(2, "terminal")),
+        threading.Thread(target=worker, args=(3, "read_file")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert errors == []
+    assert foreign == []
+    assert Counter(completed) == {"terminal": 2 * n_ids, "read_file": 2 * n_ids}

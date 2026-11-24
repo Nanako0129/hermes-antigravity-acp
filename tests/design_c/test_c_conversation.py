@@ -360,3 +360,309 @@ def test_refused_native_attempt_does_not_cancel_the_turn(tmp_path):
         assert not any(e["ev"] == "cancel" for e in events(log))
     finally:
         conv.close()
+
+
+_M3_FAKE_AGY = r'''
+import json, os, sys, threading, time, urllib.request
+
+B = json.loads(sys.argv[1])
+LOG = B["log"]
+lock = threading.Lock()
+state = {"sessions": {}, "inflight": None, "next_sid": 0, "pending": {}}
+
+
+def log(**kw):
+    with lock, open(LOG, "a") as fh:
+        fh.write(json.dumps(kw) + "\n")
+
+
+def emit(obj):
+    with lock:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+
+def update(sid, payload):
+    emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": payload}})
+
+
+def request_permission(sid, tcid, server_name, tool_name):
+    rid = f"perm-{time.monotonic_ns()}"
+    ev = threading.Event()
+    slot = {"event": ev, "resp": None}
+    with lock:
+        state["pending"][rid] = slot
+    emit({
+        "jsonrpc": "2.0",
+        "id": rid,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": sid,
+            "toolCall": {
+                "toolCallId": tcid,
+                "title": f"{server_name}_{tool_name}",
+                "_meta": {"is_mcp_tool_call": True, "mcp": {"server": server_name, "tool": tool_name}},
+            },
+            "options": [{"optionId": "allow", "name": "allow_once", "kind": "allow_once"}],
+        },
+    })
+    ev.wait(10.0)
+    with lock:
+        state["pending"].pop(rid, None)
+
+
+def mcp_call(server, name, arguments):
+    headers = {h["name"]: h["value"] for h in server.get("headers", [])}
+    headers.update({"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    }).encode()
+    req = urllib.request.Request(server["url"], data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read() or b"{}")
+    except Exception as exc:
+        return {"error": type(exc).__name__}
+    res = data.get("result") or {}
+    text = "".join(c.get("text", "") for c in res.get("content", []))
+    return {"text": text, "isError": bool(res.get("isError"))}
+
+
+def do_call(sid, server, call_spec, *, sync_perm=False, skip_completed=False):
+    tcid = f"tc{time.monotonic_ns()}"
+    name, args = call_spec["name"], call_spec.get("arguments", {})
+    if sync_perm:
+        request_permission(sid, tcid, server["name"], name)
+    update(sid, {
+        "sessionUpdate": "tool_call",
+        "toolCallId": tcid,
+        "status": "in_progress",
+        "title": server["name"] + "_" + name,
+        "_meta": {"is_mcp_tool_call": True, "mcp": {"server": server["name"], "tool": name}},
+    })
+    ans = mcp_call(server, name, args)
+    log(ev="answer", sid=sid, name=name, args=args, **ans)
+    failed = bool(ans.get("isError") or ans.get("error"))
+    if failed:
+        update(sid, {"sessionUpdate": "tool_call_update", "toolCallId": tcid, "status": "failed"})
+    elif not skip_completed:
+        update(sid, {"sessionUpdate": "tool_call_update", "toolCallId": tcid, "status": "completed"})
+    return ans, failed
+
+
+def run_prompt(rid, sid, steps, token):
+    server = state["sessions"][sid]
+    last = ""
+    for step in steps:
+        if token["cancelled"]:
+            return
+        if "call" in step:
+            ans, failed = do_call(
+                sid, server, step["call"],
+                sync_perm=bool(step.get("sync_perm")),
+                skip_completed=bool(step.get("skip_completed")),
+            )
+            if failed and step.get("retry_on_error"):
+                ans, _ = do_call(sid, server, step["call"], skip_completed=bool(step.get("skip_completed")))
+            last = ans.get("text", "")
+        elif "text" in step:
+            update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": step["text"]}})
+        elif step.get("echo_last"):
+            update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": last}})
+    with lock:
+        if token["done"]:
+            return
+        token["done"] = True
+    emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method, rid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    if method is None and rid is not None:
+        with lock:
+            slot = state["pending"].get(rid)
+        if slot is not None:
+            slot["resp"] = msg
+            slot["event"].set()
+        continue
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": 1,
+            "agentInfo": {"name": "antigravity-acp", "version": "1.5.2"},
+            "agentCapabilities": {"mcpCapabilities": {"http": True}, "promptCapabilities": {"image": True}},
+        }})
+    elif method == "session/new":
+        state["next_sid"] += 1
+        sid = f"s{state['next_sid']}"
+        state["sessions"][sid] = params["mcpServers"][0]
+        log(ev="new", sid=sid)
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": sid}})
+    elif method in ("session/set_model", "session/set_config_option", "session/close"):
+        emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif method == "session/prompt":
+        sid = params["sessionId"]
+        n = sum(1 for ln in open(LOG) if '"ev": "prompt"' in ln) if os.path.exists(LOG) else 0
+        log(ev="prompt", sid=sid, n=n)
+        steps = B["script"][n] if n < len(B["script"]) else [{"text": "ok"}]
+        token = {"cancelled": False, "done": False, "rid": rid}
+        state["inflight"] = token
+        threading.Thread(target=run_prompt, args=(rid, sid, steps, token), daemon=True).start()
+    elif method == "session/cancel":
+        token = state["inflight"]
+        log(ev="cancel", sid=params.get("sessionId"))
+        if token and not token["done"]:
+            token["cancelled"] = True
+            token["done"] = True
+            emit({"jsonrpc": "2.0", "id": token["rid"], "result": {"stopReason": "cancelled"}})
+    elif rid is not None and method:
+        emit({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "nf"}})
+'''
+
+
+def _make_m3_conv(tmp_path, script, **kw):
+    fake = tmp_path / "m3_fake_agy.py"
+    fake.write_text(_M3_FAKE_AGY)
+    log = tmp_path / "m3_agy.log"
+    behaviour = json.dumps({"script": script, "log": str(log)})
+
+    def spawn(key, cwd):
+        conn = AcpConnection(sys.executable, [str(fake), behaviour], cwd)
+        conn.start()
+        conn.initialize()
+        return conn
+
+    return Conversation("k-m3", spawn, **kw), log
+
+
+def _inject_drop_on_sends(server, drop_indices):
+    handler_cls = server._httpd.RequestHandlerClass
+    orig_send = handler_cls._send
+    counter = {"n": 0}
+
+    def wrapped_send(self, status, payload=None):
+        if (
+            status == 200
+            and isinstance(payload, dict)
+            and isinstance(payload.get("result"), dict)
+            and "content" in payload["result"]
+        ):
+            counter["n"] += 1
+            if counter["n"] in drop_indices:
+                raise ConnectionResetError(f"simulated drop #{counter['n']}")
+        return orig_send(self, status, payload)
+
+    handler_cls._send = wrapped_send
+
+
+def test_probe1_dropped_http_200_retry_hits_completed_cache_single_handoff(tmp_path):
+    conv, log = _make_m3_conv(tmp_path, [[
+        {"call": {"name": "fetch", "arguments": {"k": "a"}}, "retry_on_error": True},
+        {"echo_last": True},
+    ]])
+    try:
+        msgs = [SYS, U1]
+        r1 = conv.run(msgs, TOOLS, "m")
+        assert [c.arguments for c in r1["tool_calls"]] == [{"k": "a"}]
+        _inject_drop_on_sends(conv.server, {1})
+        msgs += [asst(r1["tool_calls"]), *tool_rows(r1["tool_calls"], ["A-cached"])]
+        r2 = conv.run(msgs, TOOLS, "m")
+        assert r2["tool_calls"] == [] and r2["text"] == "A-cached"
+        ev = events(log)
+        answers = [e for e in ev if e["ev"] == "answer"]
+        assert len(answers) == 2
+        assert "error" in answers[0]
+        assert answers[1]["text"] == "A-cached"
+        assert [e["n"] for e in ev if e["ev"] == "prompt"] == [0]
+    finally:
+        conv.close()
+
+
+def test_probe2_intentional_repeat_after_completed_hands_out_twice(tmp_path):
+    conv, log = _make_m3_conv(tmp_path, [[
+        {"call": {"name": "fetch", "arguments": {"k": "a"}}},
+        {"call": {"name": "fetch", "arguments": {"k": "a"}}, "sync_perm": True},
+        {"echo_last": True},
+    ]])
+    try:
+        msgs = [SYS, U1]
+        r1 = conv.run(msgs, TOOLS, "m")
+        assert [c.arguments for c in r1["tool_calls"]] == [{"k": "a"}]
+        msgs += [asst(r1["tool_calls"]), *tool_rows(r1["tool_calls"], ["FIRST"])]
+        r2 = conv.run(msgs, TOOLS, "m")
+        assert [c.arguments for c in r2["tool_calls"]] == [{"k": "a"}]
+        assert r2["tool_calls"][0].id != r1["tool_calls"][0].id
+        msgs += [asst(r2["tool_calls"]), *tool_rows(r2["tool_calls"], ["SECOND"])]
+        r3 = conv.run(msgs, TOOLS, "m")
+        assert r3["tool_calls"] == [] and r3["text"] == "SECOND"
+        ev = events(log)
+        assert [e["text"] for e in ev if e["ev"] == "answer"] == ["FIRST", "SECOND"]
+        assert [e["n"] for e in ev if e["ev"] == "prompt"] == [0]
+    finally:
+        conv.close()
+
+
+def test_degenerate_nudge_clears_completed_cache_before_reissue(tmp_path):
+    conv, log = _make_m3_conv(tmp_path, [
+        [{"call": {"name": "fetch", "arguments": {"k": "a"}}, "skip_completed": True}, {"text": "}"}],
+        [{"call": {"name": "fetch", "arguments": {"k": "a"}}}, {"echo_last": True}],
+    ])
+    try:
+        msgs = [SYS, U1]
+        r1 = conv.run(msgs, TOOLS, "m")
+        assert [c.arguments for c in r1["tool_calls"]] == [{"k": "a"}]
+        msgs += [asst(r1["tool_calls"]), *tool_rows(r1["tool_calls"], ["BEFORE-NUDGE"])]
+        r2 = conv.run(msgs, TOOLS, "m")
+        # Degenerate "}" triggered nudge + clear_completed(); re-issued call parks freshly.
+        assert [c.arguments for c in r2["tool_calls"]] == [{"k": "a"}]
+        assert r2["tool_calls"][0].id != r1["tool_calls"][0].id
+        msgs += [asst(r2["tool_calls"]), *tool_rows(r2["tool_calls"], ["AFTER-NUDGE"])]
+        r3 = conv.run(msgs, TOOLS, "m")
+        assert r3["tool_calls"] == [] and r3["text"] == "AFTER-NUDGE"
+        ev = events(log)
+        prompts = [e for e in ev if e["ev"] == "prompt"]
+        assert len(prompts) == 2 and prompts[0]["sid"] == prompts[1]["sid"]
+        assert [e["text"] for e in ev if e["ev"] == "answer"] == ["BEFORE-NUDGE", "AFTER-NUDGE"]
+    finally:
+        conv.close()
+
+
+def test_resume_held_clears_prior_round_cache_while_preserving_handed_round(tmp_path):
+    conv, log = _make_m3_conv(tmp_path, [[
+        {"call": {"name": "fetch", "arguments": {"k": "r1"}}, "retry_on_error": False},
+        {"call": {"name": "fetch", "arguments": {"k": "r2"}}, "retry_on_error": True},
+        {"call": {"name": "fetch", "arguments": {"k": "r1"}}},
+        {"echo_last": True},
+    ]])
+    try:
+        msgs = [SYS, U1]
+        r1 = conv.run(msgs, TOOLS, "m")
+        assert [c.arguments for c in r1["tool_calls"]] == [{"k": "r1"}]
+        # Drop HTTP 200 for both round 1 (r1) and round 2's first send (r2).
+        _inject_drop_on_sends(conv.server, {1, 2})
+        msgs += [asst(r1["tool_calls"]), *tool_rows(r1["tool_calls"], ["R1-DROPPED"])]
+        r2 = conv.run(msgs, TOOLS, "m")
+        assert [c.arguments for c in r2["tool_calls"]] == [{"k": "r2"}]
+        # Round 1's un-retried dropped entry is still cached until round 2 enters resume_held.
+        assert len(conv.server._completed) == 1
+
+        msgs += [asst(r2["tool_calls"]), *tool_rows(r2["tool_calls"], ["R2-CACHED"])]
+        r3 = conv.run(msgs, TOOLS, "m")
+        # Round 2's retry of r2 hit _completed (preserved by preserve_parked=True), while r1 was cleared
+        # on round 2 resume_held and therefore parks freshly for Hermes.
+        assert [c.arguments for c in r3["tool_calls"]] == [{"k": "r1"}]
+        assert r3["tool_calls"][0].id != r1["tool_calls"][0].id
+
+        msgs += [asst(r3["tool_calls"]), *tool_rows(r3["tool_calls"], ["R1-FRESH"])]
+        r4 = conv.run(msgs, TOOLS, "m")
+        assert r4["tool_calls"] == [] and r4["text"] == "R1-FRESH"
+
+        answers = [e for e in events(log) if e["ev"] == "answer"]
+        assert len(answers) == 4
+        assert answers[0]["args"] == {"k": "r1"} and "error" in answers[0]
+        assert answers[1]["args"] == {"k": "r2"} and "error" in answers[1]
+        assert answers[2]["args"] == {"k": "r2"} and answers[2]["text"] == "R2-CACHED"
+        assert answers[3]["args"] == {"k": "r1"} and answers[3]["text"] == "R1-FRESH"
+    finally:
+        conv.close()
