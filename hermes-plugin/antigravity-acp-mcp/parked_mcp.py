@@ -33,6 +33,7 @@ _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 _DROP = object()  # sentinel: close the HTTP connection without a JSON-RPC result
 _MAX_COMPLETED_CACHE = 32
 _MAX_COMPLETED_BYTES = 8 * 1024 * 1024
+_MAX_SIGNATURE_BYTES = 16 * 1024 * 1024
 
 
 @dataclass
@@ -48,8 +49,43 @@ class _CompletedCall:
     inflight_sends: int = 0
 
 
-def _canonical_signature(name: str, arguments: dict[str, Any]) -> str:
-    return name + "\0" + json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+@dataclass
+class _UncachedDelivery:
+    name: str
+    epoch: int
+    inflight_sends: int = 1
+    delivery_ok: bool = False
+    rolled_back: bool = False
+
+
+def signature_key(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    max_bytes: int = _MAX_SIGNATURE_BYTES,
+) -> bytes | None:
+    """Return SHA-256 of ``name + '\\0' + canonical_json(arguments)``, or ``None`` if invalid/oversized."""
+    if not isinstance(name, str) or not isinstance(arguments, dict) or max_bytes < 0:
+        return None
+    try:
+        prefix = (name + "\0").encode("utf-8")
+    except ValueError:
+        return None
+    total = len(prefix)
+    if total > max_bytes:
+        return None
+    hasher = hashlib.sha256(prefix)
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    try:
+        for chunk in encoder.iterencode(arguments):
+            encoded = chunk.encode("utf-8")
+            total += len(encoded)
+            if total > max_bytes:
+                return None
+            hasher.update(encoded)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return None
+    return hasher.digest()
 
 
 class ParkedCall:
@@ -59,11 +95,11 @@ class ParkedCall:
     message_sanitization.py) and not ``call_<digits>``.
     """
 
-    def __init__(self, name: str, arguments: dict[str, Any]) -> None:
+    def __init__(self, name: str, arguments: dict[str, Any], *, sig_key: bytes | None = None) -> None:
         self.id = "call_" + uuid.uuid4().hex
         self.name = name
         self.arguments = arguments
-        self.signature = _canonical_signature(name, arguments)
+        self.sig_key: bytes = sig_key if sig_key is not None else (signature_key(name, arguments) or b"")
         self.state = "parked"  # parked | answered | abandoned | deadline
         self.text = ""
         self.is_error = False
@@ -71,6 +107,7 @@ class ParkedCall:
         self.drop_connection = False
         self._epoch: int = 0
         self._completed_entry: _CompletedCall | None = None
+        self._uncached_entry: _UncachedDelivery | None = None
         self._lock = threading.Lock()
         self._done = threading.Event()
 
@@ -132,6 +169,8 @@ class ParkedMcpServer:
         self._completed: dict[bytes, _CompletedCall] = {}  # sha256(signature) -> answered call awaiting ACP completion
         self._completed_bytes: int = 0
         self._completed_seq: int = 0
+        self._uncached_answered: dict[str, int] = {}
+        self._uncorrelated_completions: dict[str, int] = {}
         self._epoch: int = 0
         self._retired = False
         self._httpd: _LoopbackHTTPServer | None = None
@@ -161,33 +200,93 @@ class ParkedMcpServer:
             self._retired = True
             self._completed.clear()
             self._completed_bytes = 0
+            self._uncached_answered.clear()
+            self._uncorrelated_completions.clear()
             self._epoch += 1
 
-    def mark_completed(self, tool_name: str) -> bool:
-        """Evict the oldest completed entry for ``tool_name`` once ACP reports it completed."""
+    def mark_completed(self, tool_name: str, sig_keys: Sequence[bytes] = ()) -> bool:
+        """Evict completed cache entry/entries for ``tool_name`` once ACP reports completion.
+
+        Layer 1 (``sig_keys`` non-empty): evict only the first matching non-failed entry in
+        ``sig_keys`` priority order (never falling back to an unrelated sibling), then reconcile
+        any deferred Layer 2 completions for ``tool_name``.
+
+        Layer 2 (``sig_keys`` empty): evict immediately only when unambiguous (a single cached
+        entry and no uncached answers); otherwise defer until the full batch completes.
+        """
         with self._lock:
-            tier1 = [
-                (k, e)
-                for k, e in self._completed.items()
-                if e.name == tool_name and e.delivery_ok and not e.delivery_failed
-            ]
-            candidates = tier1 or [
-                (k, e)
+            if self._retired:
+                return False
+            if sig_keys:
+                for k in sig_keys:
+                    entry = self._completed.get(k)
+                    if entry is not None and entry.name == tool_name and not entry.delivery_failed:
+                        del self._completed[k]
+                        self._completed_bytes = max(0, self._completed_bytes - entry.size_bytes)
+                        uncorr = self._uncorrelated_completions.get(tool_name, 0)
+                        if uncorr > 0:
+                            remaining = [
+                                rk
+                                for rk, re in self._completed.items()
+                                if re.name == tool_name and not re.delivery_failed
+                            ]
+                            uncached = self._uncached_answered.get(tool_name, 0)
+                            if not remaining:
+                                if uncached > 0:
+                                    left = uncached - min(uncached, uncorr)
+                                    if left > 0:
+                                        self._uncached_answered[tool_name] = left
+                                    else:
+                                        self._uncached_answered.pop(tool_name, None)
+                                self._uncorrelated_completions.pop(tool_name, None)
+                            elif uncorr >= len(remaining) + uncached:
+                                for rk in remaining:
+                                    evicted = self._completed.pop(rk)
+                                    self._completed_bytes = max(
+                                        0, self._completed_bytes - evicted.size_bytes
+                                    )
+                                self._uncorrelated_completions.pop(tool_name, None)
+                                self._uncached_answered.pop(tool_name, None)
+                        return True
+                return False
+
+            candidates = [
+                k
                 for k, e in self._completed.items()
                 if e.name == tool_name and not e.delivery_failed
             ]
+            uncached = self._uncached_answered.get(tool_name, 0)
             if not candidates:
+                if uncached > 0:
+                    rem = uncached - 1
+                    if rem > 0:
+                        self._uncached_answered[tool_name] = rem
+                    else:
+                        self._uncached_answered.pop(tool_name, None)
                 return False
-            sig_key, entry = min(candidates, key=lambda item: item[1].seq)
-            del self._completed[sig_key]
-            self._completed_bytes = max(0, self._completed_bytes - entry.size_bytes)
-            return True
+            if len(candidates) == 1 and uncached == 0:
+                evicted = self._completed.pop(candidates[0])
+                self._completed_bytes = max(0, self._completed_bytes - evicted.size_bytes)
+                self._uncorrelated_completions.pop(tool_name, None)
+                return True
+            count = self._uncorrelated_completions.get(tool_name, 0) + 1
+            if count >= len(candidates) + uncached:
+                for ck in candidates:
+                    evicted = self._completed.pop(ck)
+                    self._completed_bytes = max(0, self._completed_bytes - evicted.size_bytes)
+                self._uncorrelated_completions.pop(tool_name, None)
+                self._uncached_answered.pop(tool_name, None)
+                return True
+            self._uncorrelated_completions[tool_name] = count
+            return False
 
     def clear_completed(self, *, preserve_parked: bool = False) -> None:
         """Flush cached completed answers and advance the cache epoch."""
         with self._lock:
             self._completed.clear()
             self._completed_bytes = 0
+            self._uncached_answered.clear()
+            self._uncorrelated_completions.clear()
             self._epoch += 1
             if preserve_parked:
                 for call in self._live.values():
@@ -281,15 +380,49 @@ class ParkedMcpServer:
                 if msg.get("id") is None:  # notification
                     self._send(202)
                     return
-                response, sig_key, entry = bridge._dispatch_rpc(msg["id"], msg.get("method"), msg.get("params"))
+                response, sig_key, entry, uncached_delivery = bridge._dispatch_rpc(
+                    msg["id"], msg.get("method"), msg.get("params")
+                )
                 if response is _DROP:
                     self.close_connection = True
                     return
                 if entry is None:
-                    try:
-                        self._send(200, response)
-                    except OSError:
-                        self.close_connection = True
+                    if uncached_delivery is None:
+                        try:
+                            self._send(200, response)
+                        except OSError:
+                            self.close_connection = True
+                    else:
+                        succeeded = False
+                        try:
+                            self._send(200, response)
+                            succeeded = True
+                        except OSError:
+                            self.close_connection = True
+                        finally:
+                            with bridge._lock:
+                                uncached_delivery.inflight_sends = max(
+                                    0, uncached_delivery.inflight_sends - 1
+                                )
+                                if succeeded:
+                                    uncached_delivery.delivery_ok = True
+                                elif (
+                                    not uncached_delivery.delivery_ok
+                                    and uncached_delivery.inflight_sends == 0
+                                    and not uncached_delivery.rolled_back
+                                    and bridge._epoch == uncached_delivery.epoch
+                                    and not bridge._retired
+                                ):
+                                    uncached_delivery.rolled_back = True
+                                    remaining = (
+                                        bridge._uncached_answered.get(uncached_delivery.name, 0) - 1
+                                    )
+                                    if remaining > 0:
+                                        bridge._uncached_answered[uncached_delivery.name] = (
+                                            remaining
+                                        )
+                                    else:
+                                        bridge._uncached_answered.pop(uncached_delivery.name, None)
                 else:
                     succeeded = False
                     try:
@@ -320,7 +453,7 @@ class ParkedMcpServer:
 
     def _dispatch_rpc(
         self, req_id: Any, method: Any, params: Any
-    ) -> tuple[Any, bytes | None, _CompletedCall | None]:
+    ) -> tuple[Any, bytes | None, _CompletedCall | None, _UncachedDelivery | None]:
         if method == "initialize":
             return (
                 {
@@ -334,42 +467,44 @@ class ParkedMcpServer:
                 },
                 None,
                 None,
+                None,
             )
         if method == "ping":
-            return {"jsonrpc": "2.0", "id": req_id, "result": {}}, None, None
+            return {"jsonrpc": "2.0", "id": req_id, "result": {}}, None, None, None
         if method == "tools/list":
             tools = [
                 {"description": "", "inputSchema": {"type": "object", "properties": {}}, **t}
                 for t in self._tools.values()
             ]
-            return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}}, None, None
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}}, None, None, None
         if method == "tools/call":
             return self._handle_tool_call_with_ref(req_id, params)
-        return _rpc_error(req_id, -32601, f"Method not found: {method}"), None, None
+        return _rpc_error(req_id, -32601, f"Method not found: {method}"), None, None, None
 
     def _handle_tool_call_with_ref(
         self, req_id: Any, params: Any
-    ) -> tuple[Any, bytes | None, _CompletedCall | None]:
+    ) -> tuple[Any, bytes | None, _CompletedCall | None, _UncachedDelivery | None]:
         if not isinstance(params, dict):
-            return _rpc_error(req_id, -32602, "Invalid params"), None, None
+            return _rpc_error(req_id, -32602, "Invalid params"), None, None, None
         name = str(params.get("name") or "").strip()
         arguments = params.get("arguments")
         arguments = {} if arguments is None else arguments
         if not isinstance(arguments, dict):
-            return _rpc_error(req_id, -32602, "Tool arguments must be an object"), None, None
+            return _rpc_error(req_id, -32602, "Tool arguments must be an object"), None, None, None
         if name not in self._tools:
-            return _rpc_error(req_id, -32602, f"Undeclared tool: {name}"), None, None
+            return _rpc_error(req_id, -32602, f"Undeclared tool: {name}"), None, None, None
 
-        signature = _canonical_signature(name, arguments)
-        sig_key = hashlib.sha256(signature.encode("utf-8")).digest()
+        sig_key = signature_key(name, arguments)
+        if sig_key is None:
+            return _rpc_error(req_id, -32602, "Invalid tool arguments"), None, None, None
         with self._lock:
             if self._retired:
-                return _tool_result(req_id, "session retired", True), None, None
+                return _tool_result(req_id, "session retired", True), None, None, None
             if (cached := self._completed.get(sig_key)) is not None:
                 cached.inflight_sends += 1
                 cached.delivery_ok = False
                 cached.delivery_failed = False
-                return _tool_result(req_id, cached.text, cached.is_error, cached.images), sig_key, cached
+                return _tool_result(req_id, cached.text, cached.is_error, cached.images), sig_key, cached, None
             call = self._live.get(sig_key)  # M3: same signature shares the parked call
             if call is not None:
                 with call._lock:
@@ -383,7 +518,7 @@ class ParkedMcpServer:
                 reusable = False
             fresh = not reusable
             if fresh:
-                call = ParkedCall(name, arguments)
+                call = ParkedCall(name, arguments, sig_key=sig_key)
                 call._epoch = self._epoch
                 self._live[sig_key] = call
             assert call is not None
@@ -398,49 +533,84 @@ class ParkedMcpServer:
             if self._on_deadline:
                 self._on_deadline(call)
         completed_ref: tuple[bytes | None, _CompletedCall | None] = (None, None)
+        uncached_delivery: _UncachedDelivery | None = None
         with self._lock:
             if self._live.get(sig_key) is call:
                 del self._live[sig_key]
                 if (
                     call.state == "answered"
-                    and not call.is_error
                     and not call.drop_connection
                     and not self._retired
                     and call._epoch == self._epoch
                 ):
-                    size_bytes = len(call.text.encode("utf-8")) + sum(
-                        len(m.encode("utf-8")) + len(d.encode("utf-8")) for m, d in call.images
-                    )
-                    if size_bytes <= _MAX_COMPLETED_BYTES:
-                        self._completed_seq += 1
-                        entry = _CompletedCall(
-                            name=name,
-                            text=call.text,
-                            is_error=call.is_error,
-                            images=list(call.images),
-                            seq=self._completed_seq,
-                            size_bytes=size_bytes,
-                            inflight_sends=1,
+                    if call.is_error:
+                        u_entry = _UncachedDelivery(name=name, epoch=self._epoch, inflight_sends=1)
+                        self._uncached_answered[name] = self._uncached_answered.get(name, 0) + 1
+                        call._uncached_entry = u_entry
+                        uncached_delivery = u_entry
+                    else:
+                        size_bytes = len(call.text.encode("utf-8")) + sum(
+                            len(m.encode("utf-8")) + len(d.encode("utf-8")) for m, d in call.images
                         )
-                        if (old := self._completed.pop(sig_key, None)) is not None:
-                            self._completed_bytes -= old.size_bytes
-                        self._completed[sig_key] = entry
-                        self._completed_bytes += size_bytes
-                        while (
-                            len(self._completed) > _MAX_COMPLETED_CACHE
-                            or self._completed_bytes > _MAX_COMPLETED_BYTES
-                        ):
-                            oldest_key = min(self._completed, key=lambda k: self._completed[k].seq)
-                            evicted = self._completed.pop(oldest_key)
-                            self._completed_bytes -= evicted.size_bytes
-                        call._completed_entry = entry
-                        completed_ref = (sig_key, entry)
+                        if size_bytes <= _MAX_COMPLETED_BYTES:
+                            self._completed_seq += 1
+                            entry = _CompletedCall(
+                                name=name,
+                                text=call.text,
+                                is_error=call.is_error,
+                                images=list(call.images),
+                                seq=self._completed_seq,
+                                size_bytes=size_bytes,
+                                inflight_sends=1,
+                            )
+                            if (old := self._completed.pop(sig_key, None)) is not None:
+                                self._completed_bytes -= old.size_bytes
+                            self._completed[sig_key] = entry
+                            self._completed_bytes += size_bytes
+                            while (
+                                len(self._completed) > _MAX_COMPLETED_CACHE
+                                or self._completed_bytes > _MAX_COMPLETED_BYTES
+                            ):
+                                oldest_key = min(self._completed, key=lambda k: self._completed[k].seq)
+                                evicted = self._completed.pop(oldest_key)
+                                self._completed_bytes -= evicted.size_bytes
+                                if not evicted.delivery_failed:
+                                    rem = self._uncorrelated_completions.get(evicted.name, 0) - 1
+                                    if rem > 0:
+                                        self._uncorrelated_completions[evicted.name] = rem
+                                    else:
+                                        self._uncorrelated_completions.pop(evicted.name, None)
+                            call._completed_entry = entry
+                            completed_ref = (sig_key, entry)
+                        else:
+                            u_entry = _UncachedDelivery(name=name, epoch=self._epoch, inflight_sends=1)
+                            self._uncached_answered[name] = self._uncached_answered.get(name, 0) + 1
+                            call._uncached_entry = u_entry
+                            uncached_delivery = u_entry
             else:
                 entry = call._completed_entry
                 if entry is not None and self._completed.get(sig_key) is entry:
                     entry.inflight_sends += 1
                     entry.delivery_failed = False
                     completed_ref = (sig_key, entry)
+                elif (
+                    entry is None
+                    and (u_entry := call._uncached_entry) is not None
+                    and u_entry.epoch == self._epoch
+                    and not self._retired
+                ):
+                    u_entry.inflight_sends += 1
+                    if u_entry.rolled_back:
+                        self._uncached_answered[u_entry.name] = (
+                            self._uncached_answered.get(u_entry.name, 0) + 1
+                        )
+                        u_entry.rolled_back = False
+                    uncached_delivery = u_entry
         if call.drop_connection:
-            return _DROP, None, None
-        return _tool_result(req_id, call.text, call.is_error, call.images), completed_ref[0], completed_ref[1]
+            return _DROP, None, None, None
+        return (
+            _tool_result(req_id, call.text, call.is_error, call.images),
+            completed_ref[0],
+            completed_ref[1],
+            uncached_delivery,
+        )

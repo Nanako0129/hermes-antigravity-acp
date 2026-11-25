@@ -386,23 +386,26 @@ def update(sid, payload):
     emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": payload}})
 
 
-def request_permission(sid, tcid, server_name, tool_name):
+def request_permission(sid, tcid, server_name, tool_name, raw_input=None):
     rid = f"perm-{time.monotonic_ns()}"
     ev = threading.Event()
     slot = {"event": ev, "resp": None}
     with lock:
         state["pending"][rid] = slot
+    tool_call = {
+        "toolCallId": tcid,
+        "title": f"{server_name}_{tool_name}",
+        "_meta": {"is_mcp_tool_call": True, "mcp": {"server": server_name, "tool": tool_name}},
+    }
+    if raw_input is not None:
+        tool_call["rawInput"] = raw_input
     emit({
         "jsonrpc": "2.0",
         "id": rid,
         "method": "session/request_permission",
         "params": {
             "sessionId": sid,
-            "toolCall": {
-                "toolCallId": tcid,
-                "title": f"{server_name}_{tool_name}",
-                "_meta": {"is_mcp_tool_call": True, "mcp": {"server": server_name, "tool": tool_name}},
-            },
+            "toolCall": tool_call,
             "options": [{"optionId": "allow", "name": "allow_once", "kind": "allow_once"}],
         },
     })
@@ -466,6 +469,83 @@ def run_prompt(rid, sid, steps, token):
             if failed and step.get("retry_on_error"):
                 ans, _ = do_call(sid, server, step["call"], skip_completed=bool(step.get("skip_completed")))
             last = ans.get("text", "")
+        elif "concurrent_rhgo" in step:
+            spec = step["concurrent_rhgo"]
+            name = spec["name"]
+            args_a = spec["args_a"]
+            args_b = spec["args_b"]
+            with_raw = bool(spec.get("agy152_raw_input"))
+            tc_a = f"tcA-{time.monotonic_ns()}"
+            tc_b = f"tcB-{time.monotonic_ns()}"
+            raw_a = {"arguments": args_a, **args_a} if with_raw else None
+            raw_b = {"arguments": args_b, **args_b} if with_raw else None
+
+            def emit_call_start(tcid, raw_input):
+                if with_raw:
+                    update(sid, {
+                        "sessionUpdate": "tool_call", "toolCallId": tcid, "status": "pending",
+                        "title": server["name"] + "_" + name,
+                        "_meta": {"is_mcp_tool_call": True, "mcp": {"server": server["name"], "tool": name}},
+                        "rawInput": raw_input,
+                    })
+                request_permission(sid, tcid, server["name"], name, raw_input=raw_input)
+                in_prog = {
+                    "sessionUpdate": "tool_call_update", "toolCallId": tcid, "status": "in_progress",
+                    "title": server["name"] + "_" + name,
+                    "_meta": {"is_mcp_tool_call": True, "mcp": {"server": server["name"], "tool": name}},
+                }
+                if raw_input is not None:
+                    in_prog["rawInput"] = raw_input
+                update(sid, in_prog)
+
+            emit_call_start(tc_a, raw_a)
+            emit_call_start(tc_b, raw_b)
+
+            a_sent = threading.Event()
+            b_completed = threading.Event()
+            res_holder = {}
+
+            def run_a():
+                a_sent.set()
+                lost = mcp_call(server, name, args_a)
+                log(ev="answer", sid=sid, name=name, args=args_a, phase="lost_after_200", **lost)
+                b_completed.wait(10.0)
+                retried = mcp_call(server, name, args_a)
+                log(ev="answer", sid=sid, name=name, args=args_a, phase="retry", **retried)
+                res_holder["a"] = retried.get("text", "")
+                update(sid, {"sessionUpdate": "tool_call_update", "toolCallId": tc_a, "status": "completed"})
+
+            def run_b():
+                a_sent.wait(5.0)
+                time.sleep(0.02)
+                ans_b = mcp_call(server, name, args_b)
+                log(ev="answer", sid=sid, name=name, args=args_b, phase="sibling", **ans_b)
+                res_holder["b"] = ans_b.get("text", "")
+                update(sid, {"sessionUpdate": "tool_call_update", "toolCallId": tc_b, "status": "completed"})
+                request_permission(sid, tc_a, server["name"], name, raw_input=raw_a)
+                b_completed.set()
+
+            ta = threading.Thread(target=run_a, daemon=True)
+            tb = threading.Thread(target=run_b, daemon=True)
+            ta.start()
+            tb.start()
+            ta.join(15.0)
+            tb.join(15.0)
+
+            tc_a2 = f"tcA2-{time.monotonic_ns()}"
+            request_permission(sid, tc_a2, server["name"], name, raw_input=raw_a)
+            in_prog2 = {
+                "sessionUpdate": "tool_call", "toolCallId": tc_a2, "status": "in_progress",
+                "title": server["name"] + "_" + name,
+                "_meta": {"is_mcp_tool_call": True, "mcp": {"server": server["name"], "tool": name}},
+            }
+            if raw_a is not None:
+                in_prog2["rawInput"] = raw_a
+            update(sid, in_prog2)
+            fresh_a = mcp_call(server, name, args_a)
+            log(ev="answer", sid=sid, name=name, args=args_a, phase="post_batch_repeat", **fresh_a)
+            update(sid, {"sessionUpdate": "tool_call_update", "toolCallId": tc_a2, "status": "completed"})
+            last = f"{res_holder.get('a', '')}|{res_holder.get('b', '')}|{fresh_a.get('text', '')}"
         elif "text" in step:
             update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": step["text"]}})
         elif step.get("echo_last"):
@@ -664,5 +744,64 @@ def test_resume_held_clears_prior_round_cache_while_preserving_handed_round(tmp_
         assert answers[1]["args"] == {"k": "r2"} and "error" in answers[1]
         assert answers[2]["args"] == {"k": "r2"} and answers[2]["text"] == "R2-CACHED"
         assert answers[3]["args"] == {"k": "r1"} and answers[3]["text"] == "R1-FRESH"
+    finally:
+        conv.close()
+
+
+@pytest.mark.parametrize("agy152_raw_input", [True, False], ids=["layer1-rawInput", "layer2-no-rawInput"])
+def test_rhgo1749_concurrent_same_name_sibling_completion_does_not_evict_retry(tmp_path, agy152_raw_input):
+    """Regression for PR #83 concurrent same-name different-arg M3 edge case.
+
+    Call A (k="alpha") and Call B (k="beta") run concurrently on the same tool name:
+    - Call A writes HTTP 200 locally (delivery_ok=True) then response is lost in transit.
+    - Sibling Call B completes first and ACP emits tool_call_update(completed).
+    - Call A retries and MUST hit the completed cache (tool executes ONCE, not twice).
+    - After both A and B complete, a post-batch intentional repeat of A executes fresh.
+    """
+    conv, log = _make_m3_conv(
+        tmp_path,
+        [[
+            {
+                "concurrent_rhgo": {
+                    "name": "fetch",
+                    "args_a": {"k": "alpha"},
+                    "args_b": {"k": "beta"},
+                    "agy152_raw_input": agy152_raw_input,
+                },
+            },
+            {"echo_last": True},
+        ]],
+        collect_window=0.5,
+    )
+    try:
+        msgs = [SYS, U1]
+        r1 = conv.run(msgs, TOOLS, "m")
+        assert len(r1["tool_calls"]) == 2
+        by_k = {c.arguments["k"]: c for c in r1["tool_calls"]}
+        assert set(by_k) == {"alpha", "beta"}
+        answers_r1 = [
+            "ALPHA-1" if c.arguments["k"] == "alpha" else "BETA-1"
+            for c in r1["tool_calls"]
+        ]
+        msgs += [asst(r1["tool_calls"]), *tool_rows(r1["tool_calls"], answers_r1)]
+
+        # Call A's retry hits cache (zero extra handoff); next handoff is the post-batch intentional repeat.
+        r2 = conv.run(msgs, TOOLS, "m")
+        assert [c.arguments for c in r2["tool_calls"]] == [{"k": "alpha"}]
+        assert r2["tool_calls"][0].id != by_k["alpha"].id
+
+        msgs += [asst(r2["tool_calls"]), *tool_rows(r2["tool_calls"], ["ALPHA-FRESH"])]
+        r3 = conv.run(msgs, TOOLS, "m")
+        assert r3["tool_calls"] == []
+        assert r3["text"] == "ALPHA-1|BETA-1|ALPHA-FRESH"
+
+        ev = events(log)
+        answers = [e for e in ev if e["ev"] == "answer"]
+        by_phase = {e["phase"]: e for e in answers}
+        assert by_phase["lost_after_200"]["text"] == "ALPHA-1"
+        assert by_phase["sibling"]["text"] == "BETA-1"
+        assert by_phase["retry"]["text"] == "ALPHA-1"
+        assert by_phase["post_batch_repeat"]["text"] == "ALPHA-FRESH"
+        assert [e["n"] for e in ev if e["ev"] == "prompt"] == [0]
     finally:
         conv.close()
